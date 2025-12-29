@@ -7,14 +7,18 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+bs58 = "0.5"
 delay_timer = "0.11"
 dotenv = "0.15"
-jup-ag = "0.2.2"
 itertools = "0.10"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json  = "1"
 solana-client = "1.10"
 solana-sdk = "1.10"
 spl-associated-token-account = "1"
 spl-token = "3"
 tokio = { version = "1", features = ["full"] }
+actix-web = "4.4"
+actix-files = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }

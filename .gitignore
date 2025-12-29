@@ -1,6 +1,17 @@
 .env
-
+*.log
+/tmp/
 
 # Added by cargo
-
 /target
+
+# Node modules
+node_modules/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

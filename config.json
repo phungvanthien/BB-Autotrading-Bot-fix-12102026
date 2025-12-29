@@ -18,5 +18,19 @@
             "amount": 0.0012,
             "cron": "0 */1 * ? * *"
         }
+    ],
+    "conditional_jobs": [
+        {
+            "type": "bollinger_bands",
+            "input_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "output_mint": "So11111111111111111111111111111111111111112",
+            "base_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "quote_mint": "So11111111111111111111111111111111111111112",
+            "buy_amount_usd": 0.0,
+            "sell_amount": 0.1,
+            "period": 20,
+            "std_dev": 2.0,
+            "check_interval_seconds": 60
+        }
     ]
 }
