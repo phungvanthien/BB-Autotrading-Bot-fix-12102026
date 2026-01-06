@@ -548,8 +548,8 @@ struct ConditionalJob {
     output_mint: String,
     base_mint: String, // Token để tính giá (ví dụ: USDC)
     quote_mint: String, // Token để so sánh (ví dụ: SOL)
-    buy_amount_usd: f64, // Số tiền mua (USD)
-    sell_amount: f64, // Số lượng bán (token)
+    buy_amount: f64, // Số lượng SOL mua
+    sell_amount: f64, // Số lượng SOL bán
     period: usize, // Số kỳ cho Bollinger Bands (mặc định 20)
     std_dev: f64, // Độ lệch chuẩn (mặc định 2.0)
     check_interval_seconds: u64, // Khoảng thời gian kiểm tra (giây)
@@ -915,16 +915,17 @@ async fn handle_bollinger_bands_job(
     // - current_price = giá SOL/USDC (ví dụ: 150 nghĩa là 1 SOL = 150 USDC)
     
     if current_price <= lower_band {
-        // Mua 0.1 SOL khi giá đóng nến dưới band dưới
+        // Mua SOL khi giá đóng nến dưới band dưới
         println!("🚀 TÍN HIỆU MUA: Giá ({:.4}) <= BB Lower ({:.4})", current_price, lower_band);
-        println!("   → Mua 0.1 SOL từ USDC");
         
-        // Tính số lượng USDC cần để mua 0.1 SOL
-        // current_price là giá SOL/USDC, nên để mua 0.1 SOL cần: 0.1 * current_price USDC
-        let sol_amount = 0.1;
+        // Sử dụng buy_amount từ config (số lượng SOL)
+        let sol_amount = job.buy_amount;
+        
+        // Tính số lượng USDC cần để mua SOL
+        // current_price là giá SOL/USDC, nên để mua sol_amount SOL cần: sol_amount * current_price USDC
         let usdc_needed = sol_amount * current_price;
         
-        println!("   → Cần {} USDC để mua {} SOL", usdc_needed, sol_amount);
+        println!("   → Mua {} SOL từ USDC (cần {} USDC)", sol_amount, usdc_needed);
         
         let result = swap_with_record(
             input_mint,  // USDC
@@ -952,12 +953,12 @@ async fn handle_bollinger_bands_job(
         }
         
     } else if current_price >= upper_band {
-        // Bán 0.1 SOL khi giá đóng nến trên band trên
+        // Bán SOL khi giá đóng nến trên band trên
         println!("📉 TÍN HIỆU BÁN: Giá ({:.4}) >= BB Upper ({:.4})", current_price, upper_band);
-        println!("   → Bán 0.1 SOL để lấy USDC");
         
-        let sol_amount = 0.1;
-        println!("   → Bán {} SOL", sol_amount);
+        // Sử dụng sell_amount từ config
+        let sol_amount = job.sell_amount;
+        println!("   → Bán {} SOL để lấy USDC", sol_amount);
         
         let result = swap_with_record(
             output_mint, // SOL (bán)
@@ -1061,11 +1062,24 @@ async fn swap_with_record(
         0.0
     };
     
+    // Tính số lượng SOL thực tế đã giao dịch
+    // BUY: ui_amount là USDC, SOL = USDC / price
+    // SELL: ui_amount là SOL
+    let sol_amount = if order_type == "BUY" {
+        if entry_price > 0.0 {
+            ui_amount / entry_price
+        } else {
+            0.0
+        }
+    } else {
+        ui_amount // SELL: ui_amount is already SOL
+    };
+    
     // Lưu giao dịch vào state
     let trade_record = TradeRecord {
         timestamp: start_time,
         order_type: order_type.clone(),
-        amount: if order_type == "BUY" { 0.1 } else { 0.1 }, // 0.1 SOL
+        amount: sol_amount, // SOL amount from config
         price: entry_price,
         upper_band,
         lower_band,
