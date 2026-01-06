@@ -24,6 +24,9 @@ use tokio::sync::Mutex;
 use chrono::{Utc, DateTime};
 use web::{AppState, TokenBalance, TradeRecord, BollingerBandsInfo, BandPoint, PricePoint, ApiConnectionStatus};
 
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
+
 // Hàm để load keypair từ nhiều định dạng khác nhau
 fn load_keypair() -> Result<Keypair> {
     dotenv::dotenv().ok();
@@ -338,9 +341,54 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
-    loop {
-        sleep_by_tokio(Duration::from_secs(5)).await;
+    println!("🤖 Bot is running. Press Ctrl+C to stop gracefully.");
+    
+    // Set up signal handlers for graceful shutdown
+    setup_signal_handlers(app_state, delay_timer).await;
+    
+    Ok(())
+}
+
+// Set up signal handlers for SIGINT and SIGTERM
+async fn setup_signal_handlers(app_state: AppState, _delay_timer: DelayTimer) {
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("Failed to register SIGTERM handler");
+        
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n🛑 Received SIGINT (Ctrl+C). Shutting down gracefully...");
+                shutdown_bot(&app_state).await;
+            }
+            _ = sigterm.recv() => {
+                println!("\n🛑 Received SIGTERM. Shutting down gracefully...");
+                shutdown_bot(&app_state).await;
+            }
+        }
     }
+    
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.expect("Failed to wait for Ctrl+C");
+        println!("\n🛑 Received SIGINT (Ctrl+C). Shutting down gracefully...");
+        shutdown_bot(&app_state).await;
+    }
+}
+
+// Graceful shutdown function
+async fn shutdown_bot(app_state: &AppState) {
+    println!("📝 Updating bot status...");
+    
+    // Update bot status to indicate shutdown
+    {
+        let mut status = app_state.bot_status.write().await;
+        status.is_running = false;
+        status.last_update = Utc::now();
+    }
+    
+    println!("✅ Bot status updated. Shutting down...");
+    println!("👋 Goodbye!");
 }
 
 #[derive(Deserialize)]
