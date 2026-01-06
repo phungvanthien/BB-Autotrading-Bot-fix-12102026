@@ -30,8 +30,8 @@ let connection = null;
 let owner = null;
 
 // Jupiter API endpoints
-const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_API = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_QUOTE_API = 'https://lite-api.jup.ag/swap/v1/quote';
+const JUPITER_SWAP_API = 'https://lite-api.jup.ag/swap/v1/swap';
 
 // Initialize connection and wallet
 async function initialize() {
@@ -300,12 +300,37 @@ app.post('/swap', async (req, res) => {
         
         console.log(`   Transaction sent: ${txid}`);
         
-        // Wait for confirmation
+        // Wait for confirmation using polling (to avoid WebSocket subscription issues)
         console.log(`   Step 4: Waiting for confirmation...`);
-        const confirmation = await connection.confirmTransaction(txid, 'confirmed');
+        const maxRetries = 12; // 12 times max wait time
+        const retryDelay = 5000; // 5 seconds between checks => 1 minute max wait time
+        let confirmed = false;
+        let confirmationError = null;
         
-        if (confirmation.value.err) {
-            throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+        for (let i = 0; i < maxRetries; i++) {
+            const status = await connection.getSignatureStatus(txid);
+            
+            if (status.value) {
+                if (status.value.err) {
+                    confirmationError = status.value.err;
+                    break;
+                }
+                if (status.value.confirmationStatus === 'confirmed' || status.value.confirmationStatus === 'finalized') {
+                    confirmed = true;
+                    break;
+                }
+            }
+            
+            // Wait before next check
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+        }
+        
+        if (confirmationError) {
+            throw new Error(`Transaction failed: ${JSON.stringify(confirmationError)}`);
+        }
+        
+        if (!confirmed) {
+            throw new Error(`Transaction confirmation timeout after ${maxRetries} seconds`);
         }
         
         console.log(`   ✅ Swap successful: ${txid}`);

@@ -938,7 +938,7 @@ async function swapViaJupiter(req, res, inputMintPubkey, outputMintPubkey, amoun
     const slippageBps = Math.floor(slippage * 100);
     
     // Step 1: Get quote from Jupiter
-    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMintPubkey.toString()}&outputMint=${outputMintPubkey.toString()}&amount=${amountInBaseUnits}&slippageBps=${slippageBps}`;
+    const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMintPubkey.toString()}&outputMint=${outputMintPubkey.toString()}&amount=${amountInBaseUnits}&slippageBps=${slippageBps}`;
     
     console.log(`   Getting Jupiter quote: ${quoteUrl}`);
     const quoteResponse = await fetch(quoteUrl);
@@ -951,7 +951,7 @@ async function swapViaJupiter(req, res, inputMintPubkey, outputMintPubkey, amoun
     console.log(`   Jupiter quote received: ${quoteData.outAmount} output tokens`);
     
     // Step 2: Get swap transaction
-    const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+    const swapResponse = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

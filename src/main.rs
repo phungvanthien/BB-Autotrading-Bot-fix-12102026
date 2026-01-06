@@ -18,7 +18,8 @@ use spl_token::{
     amount_to_ui_amount, 
     native_mint
 };
-use std::{fs::File, time::Duration, sync::Arc};
+use std::{fs::File, time::Duration, sync::Arc, path::Path};
+use std::io::{Write, BufWriter};
 use tokio::sync::Mutex;
 use chrono::{Utc, DateTime};
 use web::{AppState, TokenBalance, TradeRecord, BollingerBandsInfo, BandPoint, PricePoint, ApiConnectionStatus};
@@ -132,55 +133,84 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let delay_timer = DelayTimerBuilder::default().build();
 
     // Xử lý DCA jobs
-    for job in jobs {
-        println!("in: {} out: {} amt: {}", job.input_mint, job.output_mint, job.amount);
-        let rpc_client = RpcClient::new_with_commitment(
-            "https://ssc-dao.genesysgo.net/".into(),
-            CommitmentConfig::confirmed(),
-        );
+    if jobs.is_empty() {
+        println!("ℹ️  No DCA jobs found in config.json, skipping DCA job setup");
+    } else {
+        println!("📋 Found {} DCA job(s), setting up...", jobs.len());
+        for job in jobs {
+            println!("in: {} out: {} amt: {}", job.input_mint, job.output_mint, job.amount);
+            let rpc_client = RpcClient::new_with_commitment(
+                "https://ssc-dao.genesysgo.net/".into(),
+                CommitmentConfig::confirmed(),
+            );
 
-        // Xử lý lỗi RPC để bot vẫn tiếp tục chạy
-        if let Err(e) = maybe_init_token_account(
-            &rpc_client,
-            &keypair,
-            Pubkey::try_from(job.output_mint.as_str())?,
-        ).await {
-            eprintln!("⚠️  Warning: Failed to init token account: {}", e);
-            eprintln!("   Bot will continue but trading may fail until RPC is available");
-        }
-        
-        let body = move || {
-
-            let kp_buf =  keypair_buf.clone();
-            let kp = Keypair::from_bytes(&kp_buf).unwrap();
-            let input_mint = Pubkey::try_from(job.input_mint.as_str()).expect("error parsing input mint");
-            let output_mint = Pubkey::try_from(job.output_mint.as_str()).expect("error parsing output mint");
-            let ui_amount = job.amount.clone();
-
-            async move {
-                match swap(
-                    input_mint,
-                    output_mint,
-                    ui_amount,
-                    1.0,
-                    kp,
-                ).await {
-                    Ok(sig) => println!("Swap successful: {}", sig),
-                    Err(e) => eprintln!("Swap error: {}", e),
-                }
+            // Xử lý lỗi RPC để bot vẫn tiếp tục chạy
+            if let Err(e) = maybe_init_token_account(
+                &rpc_client,
+                &keypair,
+                Pubkey::try_from(job.output_mint.as_str())?,
+            ).await {
+                eprintln!("⚠️  Warning: Failed to init token account: {}", e);
+                eprintln!("   Bot will continue but trading may fail until RPC is available");
             }
-        };
+            
+            let body = move || {
 
-        println!("Building DCA task {}", i + 1);
-        println!("cron str {}", &job.cron);
+                let kp_buf =  keypair_buf.clone();
+                let kp = Keypair::from_bytes(&kp_buf).unwrap();
+                let input_mint = Pubkey::try_from(job.input_mint.as_str()).expect("error parsing input mint");
+                let output_mint = Pubkey::try_from(job.output_mint.as_str()).expect("error parsing output mint");
+                let ui_amount = job.amount.clone();
 
-        let task = TaskBuilder::default()
-            .set_task_id(i.try_into().unwrap())
-            .set_frequency_repeated_by_cron_str(&job.cron)
-            .spawn_async_routine(body)?;
+                async move {
+                    let swap_start = Utc::now();
+                    match swap(
+                        input_mint,
+                        output_mint,
+                        ui_amount,
+                        1.0,
+                        kp,
+                    ).await {
+                        Ok(swap_result) => {
+                            // Log to CSV
+                            if let Err(e) = log_transaction_to_csv(swap_start, &swap_result, &input_mint, &output_mint, ui_amount) {
+                                eprintln!("⚠️  Failed to log transaction to CSV: {}", e);
+                            }
+                            println!("Swap successful: {}", swap_result.txid);
+                        }
+                        Err(e) => {
+                            // Log failed swap
+                            let failed_result = SwapResult {
+                                txid: "failed".to_string(),
+                                provider: "unknown".to_string(),
+                                amount_in: ui_amount,
+                                amount_out: 0.0,
+                                expected_out: None,
+                                status_code: 0,
+                                error_message: Some(e.to_string()),
+                                latency_ms: 0,
+                            };
+                            if let Err(log_err) = log_transaction_to_csv(swap_start, &failed_result, &input_mint, &output_mint, ui_amount) {
+                                eprintln!("⚠️  Failed to log transaction to CSV: {}", log_err);
+                            }
+                            eprintln!("Swap error: {}", e);
+                        }
+                    }
+                }
+            };
 
-        delay_timer.add_task(task)?;
-        i = i + 1;
+            println!("Building DCA task {}", i + 1);
+            println!("cron str {}", &job.cron);
+
+            let task = TaskBuilder::default()
+                .set_task_id(i.try_into().unwrap())
+                .set_frequency_repeated_by_cron_str(&job.cron)
+                .spawn_async_routine(body)?;
+
+            delay_timer.add_task(task)?;
+            i = i + 1;
+        }
+        println!("✅ DCA jobs setup complete");
     }
 
     // Xử lý Conditional jobs (Bollinger Bands)
@@ -315,6 +345,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Deserialize)]
 struct DcaJobs {
+    #[serde(default)]
     jobs: Vec<Job>,
     #[serde(default)]
     conditional_jobs: Vec<ConditionalJob>,
@@ -326,6 +357,138 @@ struct Job {
     output_mint: String,
     amount: f64,
     cron: String,
+}
+
+// Swap result with detailed information for logging
+struct SwapResult {
+    txid: String,
+    provider: String,
+    amount_in: f64,
+    amount_out: f64,
+    expected_out: Option<f64>,
+    status_code: u16,
+    error_message: Option<String>,
+    latency_ms: u64,
+}
+
+// Token symbol mapping
+fn get_token_symbol(mint: &Pubkey) -> String {
+    let mint_str = mint.to_string();
+    match mint_str.as_str() {
+        "So11111111111111111111111111111111111111112" => "SOL".to_string(),
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => "USDC".to_string(),
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => "USDT".to_string(),
+        _ => mint_str.chars().take(8).collect::<String>() + "...",
+    }
+}
+
+// Get trading pair string
+fn get_trading_pair(input_mint: &Pubkey, output_mint: &Pubkey) -> String {
+    format!("{}/{}", get_token_symbol(output_mint), get_token_symbol(input_mint))
+}
+
+// Determine side (buy or sell) based on whether we're buying SOL or selling SOL
+fn get_side(input_mint: &Pubkey, output_mint: &Pubkey) -> String {
+    let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112").unwrap();
+    if output_mint == &sol_mint {
+        "buy".to_string()
+    } else if input_mint == &sol_mint {
+        "sell".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+// Log transaction to CSV
+fn log_transaction_to_csv(
+    time: DateTime<Utc>,
+    swap_result: &SwapResult,
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount_in: f64,
+) -> Result<()> {
+    // Create logging directory if it doesn't exist
+    let log_dir = Path::new("logging");
+    if !log_dir.exists() {
+        std::fs::create_dir_all(log_dir)?;
+    }
+    
+    let csv_path = log_dir.join("transactions.csv");
+    let file_exists = csv_path.exists();
+    
+    // Open file in append mode
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&csv_path)?;
+    
+    let mut writer = BufWriter::new(file);
+    
+    // Write header if file is new
+    if !file_exists {
+        writeln!(writer, "time,txid,pair,side,amount-in,amount-out,price,expected-out,provider,latency-ms,status")?;
+    }
+    
+    // Calculate price (quote-amount / base-amount)
+    // For SOL/USDC pair: base = SOL, quote = USDC, price = USDC/SOL
+    let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112").unwrap();
+    let price = if swap_result.amount_out > 0.0 {
+        // If output is SOL (base), price = quote/base = amount_in/amount_out
+        // If input is SOL (base), price = quote/base = amount_out/amount_in
+        if output_mint == &sol_mint {
+            // Buying SOL: input is quote (USDC), output is base (SOL)
+            amount_in / swap_result.amount_out
+        } else if input_mint == &sol_mint {
+            // Selling SOL: input is base (SOL), output is quote (USDC)
+            swap_result.amount_out / amount_in
+        } else {
+            // Fallback: assume first token is base
+            amount_in / swap_result.amount_out
+        }
+    } else {
+        0.0
+    };
+    
+    // Format expected_out
+    let expected_out_str = swap_result.expected_out
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "N/A".to_string());
+    
+    // Format status with error message if any
+    let status = if let Some(ref err) = swap_result.error_message {
+        format!("{} - {}", swap_result.status_code, err)
+    } else {
+        swap_result.status_code.to_string()
+    };
+    
+    // Escape CSV fields (handle commas and quotes)
+    let escape_csv = |s: &str| {
+        if s.contains(',') || s.contains('"') || s.contains('\n') {
+            format!("\"{}\"", s.replace("\"", "\"\""))
+        } else {
+            s.to_string()
+        }
+    };
+    
+    // Write CSV row
+    writeln!(
+        writer,
+        "{},{},{},{},{},{},{},{},{},{},{}",
+        escape_csv(&time.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+        escape_csv(&swap_result.txid),
+        escape_csv(&get_trading_pair(input_mint, output_mint)),
+        escape_csv(&get_side(input_mint, output_mint)),
+        amount_in,
+        swap_result.amount_out,
+        price,
+        expected_out_str,
+        escape_csv(&swap_result.provider),
+        swap_result.latency_ms,
+        escape_csv(&status),
+    )?;
+    
+    writer.flush()?;
+    Ok(())
 }
 
 #[derive(Deserialize, Clone)]
@@ -807,11 +970,31 @@ async fn swap_with_record(
         keypair,
     ).await;
     
-    // Lấy transaction signature từ kết quả
-    if let Ok(sig) = &result {
-        transaction_signature = sig.clone();
-    } else {
-        transaction_signature = "failed".to_string();
+    // Log to CSV
+    match &result {
+        Ok(swap_result) => {
+            if let Err(e) = log_transaction_to_csv(start_time, swap_result, &input_mint, &output_mint, ui_amount) {
+                eprintln!("⚠️  Failed to log transaction to CSV: {}", e);
+            }
+            transaction_signature = swap_result.txid.clone();
+        }
+        Err(e) => {
+            // Log failed swap
+            let failed_result = SwapResult {
+                txid: "failed".to_string(),
+                provider: "unknown".to_string(),
+                amount_in: ui_amount,
+                amount_out: 0.0,
+                expected_out: None,
+                status_code: 0,
+                error_message: Some(e.to_string()),
+                latency_ms: 0,
+            };
+            if let Err(log_err) = log_transaction_to_csv(start_time, &failed_result, &input_mint, &output_mint, ui_amount) {
+                eprintln!("⚠️  Failed to log transaction to CSV: {}", log_err);
+            }
+            transaction_signature = "failed".to_string();
+        }
     }
     
     // Tính phí (ước tính, thực tế cần lấy từ transaction)
@@ -858,8 +1041,10 @@ async fn swap_with_record(
     // Note: keypair đã được move vào swap, nên không thể dùng lại ở đây
     // Sẽ được cập nhật bởi background task
     
-    result?;
-    Ok(transaction_signature)
+    match result {
+        Ok(_) => Ok(transaction_signature),
+        Err(e) => Err(e),
+    }
 }
 
 // Hàm kiểm tra kết nối API định kỳ
@@ -1016,10 +1201,10 @@ async fn swap(
     ui_amount: f64,
     slippage: f64,
     _keypair: Keypair,
-) -> Result<String> {
+) -> Result<SwapResult> {
     // Try Jupiter first (more reliable)
     match swap_via_jupiter_service(input_mint, output_mint, ui_amount, slippage).await {
-        Ok(tx_sig) => Ok(tx_sig),
+        Ok(result) => Ok(result),
         Err(jupiter_err) => {
             eprintln!("⚠️  Jupiter swap failed: {}, falling back to Raydium...", jupiter_err);
             swap_via_raydium(input_mint, output_mint, ui_amount, slippage).await
@@ -1033,7 +1218,7 @@ async fn swap_via_raydium(
     output_mint: Pubkey,
     ui_amount: f64,
     slippage: f64,
-) -> Result<String> {
+) -> Result<SwapResult> {
     const RAYDIUM_SERVICE_URL: &str = "http://localhost:3001";
     
     println!("🔄 Attempting swap via Raydium service...");
@@ -1069,6 +1254,7 @@ async fn swap_via_raydium(
     println!("📤 Sending swap request to Raydium service:");
     println!("   {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()));
     
+    let start_time = std::time::Instant::now();
     let response = client
         .post(&format!("{}/swap", RAYDIUM_SERVICE_URL))
         .json(&request_body)
@@ -1080,11 +1266,22 @@ async fn swap_via_raydium(
             anyhow::anyhow!("Raydium service request failed: {}", e)
         })?;
     
-    let status = response.status();
-    if !status.is_success() {
+    let latency_ms = start_time.elapsed().as_millis() as u64;
+    let status_code = response.status().as_u16();
+    
+    if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        eprintln!("❌ Raydium service HTTP error ({}): {}", status, error_text);
-        return Err(anyhow::anyhow!("Raydium service error ({}): {}", status, error_text));
+        eprintln!("❌ Raydium service HTTP error ({}): {}", status_code, error_text);
+        return Ok(SwapResult {
+            txid: "failed".to_string(),
+            provider: "fallback".to_string(),
+            amount_in: ui_amount,
+            amount_out: 0.0,
+            expected_out: None,
+            status_code,
+            error_message: Some(error_text),
+            latency_ms,
+        });
     }
     
     let result: serde_json::Value = response.json().await
@@ -1104,19 +1301,33 @@ async fn swap_via_raydium(
                     eprintln!("❌ Response missing transactionSignature field");
                     anyhow::anyhow!("No transaction signature in response")
                 })?;
+            
+            let amount_out = result.get("outputAmount")
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            
             println!("✅ Raydium swap successful: {}", tx_sig);
-            return Ok(tx_sig.to_string());
+            return Ok(SwapResult {
+                txid: tx_sig.to_string(),
+                provider: "fallback".to_string(), // Raydium is fallback
+                amount_in: ui_amount,
+                amount_out,
+                expected_out: None, // Raydium doesn't provide expected output in response
+                status_code: 200,
+                error_message: None,
+                latency_ms,
+            });
         }
     }
     
     // Extract error message
     let error_msg_str = result.get("error")
         .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            // If no error field, try to get the whole response as string
             let json_str = serde_json::to_string(&result).unwrap_or_else(|_| "Unknown error".to_string());
-            // Store in a static or use Box::leak for temporary, but better to use String
-            Box::leak(Box::new(json_str))
+            json_str
         });
     eprintln!("❌ Raydium swap failed: {}", error_msg_str);
     
@@ -1126,7 +1337,16 @@ async fn swap_via_raydium(
         return swap_via_jupiter_service(input_mint, output_mint, ui_amount, slippage).await;
     }
     
-    Err(anyhow::anyhow!("Raydium swap failed: {}", error_msg_str))
+    Ok(SwapResult {
+        txid: "failed".to_string(),
+        provider: "fallback".to_string(),
+        amount_in: ui_amount,
+        amount_out: 0.0,
+        expected_out: None,
+        status_code,
+        error_message: Some(error_msg_str),
+        latency_ms,
+    })
 }
 
 // Primary: Swap via Jupiter service
@@ -1135,7 +1355,7 @@ async fn swap_via_jupiter_service(
     output_mint: Pubkey,
     ui_amount: f64,
     slippage: f64,
-) -> Result<String> {
+) -> Result<SwapResult> {
     const JUPITER_SERVICE_URL: &str = "http://localhost:3002";
     
     println!("🔄 Attempting swap via Jupiter service...");
@@ -1160,6 +1380,29 @@ async fn swap_via_jupiter_service(
         }
     }
     
+    // Get quote first to get expected output (optional, don't fail if it errors)
+    let expected_out = match client
+        .post(&format!("{}/quote", JUPITER_SERVICE_URL))
+        .json(&serde_json::json!({
+            "inputMint": input_mint.to_string(),
+            "outputMint": output_mint.to_string(),
+            "amountIn": ui_amount.to_string(),
+        }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(v) => v.get("outputAmount")
+                    .and_then(|a| a.as_str())
+                    .and_then(|s| s.parse::<f64>().ok()),
+                Err(_) => None,
+            }
+        }
+        Err(_) => None,
+    };
+    
     // Thực hiện swap
     let request_body = serde_json::json!({
         "inputMint": input_mint.to_string(),
@@ -1171,6 +1414,7 @@ async fn swap_via_jupiter_service(
     println!("📤 Sending swap request to Jupiter service:");
     println!("   {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()));
     
+    let start_time = std::time::Instant::now();
     let response = client
         .post(&format!("{}/swap", JUPITER_SERVICE_URL))
         .json(&request_body)
@@ -1182,11 +1426,22 @@ async fn swap_via_jupiter_service(
             anyhow::anyhow!("Jupiter service request failed: {}", e)
         })?;
     
-    let status = response.status();
-    if !status.is_success() {
+    let latency_ms = start_time.elapsed().as_millis() as u64;
+    let status_code = response.status().as_u16();
+    
+    if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        eprintln!("❌ Jupiter service HTTP error ({}): {}", status, error_text);
-        return Err(anyhow::anyhow!("Jupiter service error ({}): {}", status, error_text));
+        eprintln!("❌ Jupiter service HTTP error ({}): {}", status_code, error_text);
+        return Ok(SwapResult {
+            txid: "failed".to_string(),
+            provider: "jupiter".to_string(),
+            amount_in: ui_amount,
+            amount_out: 0.0,
+            expected_out,
+            status_code,
+            error_message: Some(error_text),
+            latency_ms,
+        });
     }
     
     let result: serde_json::Value = response.json().await
@@ -1206,21 +1461,50 @@ async fn swap_via_jupiter_service(
                     eprintln!("❌ Response missing transactionSignature field");
                     anyhow::anyhow!("No transaction signature in response")
                 })?;
-            let provider = result.get("provider").and_then(|p| p.as_str()).unwrap_or("Jupiter");
+            
+            let provider = result.get("provider")
+                .and_then(|p| p.as_str())
+                .unwrap_or("jupiter")
+                .to_string();
+            
+            let amount_out = result.get("outputAmount")
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            
             println!("✅ {} swap successful: {}", provider, tx_sig);
-            return Ok(tx_sig.to_string());
+            return Ok(SwapResult {
+                txid: tx_sig.to_string(),
+                provider: if provider.contains("fallback") { "fallback".to_string() } else { "jupiter".to_string() },
+                amount_in: ui_amount,
+                amount_out,
+                expected_out,
+                status_code: 200,
+                error_message: None,
+                latency_ms,
+            });
         }
     }
     
     // Extract error message
     let error_msg_str = result.get("error")
         .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
         .unwrap_or_else(|| {
             let json_str = serde_json::to_string(&result).unwrap_or_else(|_| "Unknown error".to_string());
-            Box::leak(Box::new(json_str))
+            json_str
         });
     eprintln!("❌ Jupiter swap failed: {}", error_msg_str);
     
-    Err(anyhow::anyhow!("Jupiter swap failed: {}", error_msg_str))
+    Ok(SwapResult {
+        txid: "failed".to_string(),
+        provider: "jupiter".to_string(),
+        amount_in: ui_amount,
+        amount_out: 0.0,
+        expected_out,
+        status_code,
+        error_message: Some(error_msg_str),
+        latency_ms,
+    })
 }
 
