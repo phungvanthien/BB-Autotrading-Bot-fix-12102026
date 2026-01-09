@@ -438,7 +438,7 @@
                         price: currentPrice
                     };
                     saveBalanceHistory(history);
-                    return history[lastIndex];
+                    return { point: history[lastIndex], isNewPoint: false };
                 }
             }
             
@@ -458,7 +458,7 @@
             history.push(newPoint);
             saveBalanceHistory(history);
             
-            return newPoint;
+            return { point: newPoint, isNewPoint: true };
         }
         
         function initChart() {
@@ -768,11 +768,13 @@
             }
             
             // Thêm điểm dữ liệu mới (chỉ thêm nếu là giờ mới)
-            const newPoint = addBalancePoint(balances, currentPrice);
-            if (!newPoint) {
+            const result = addBalancePoint(balances, currentPrice);
+            if (!result) {
                 // Không có dữ liệu hợp lệ, không cập nhật
                 return;
             }
+            
+            const { point, isNewPoint } = result;
             
             // Lấy lịch sử
             const history = getBalanceHistory();
@@ -787,19 +789,24 @@
                 return;
             }
             
-            // Update SOL chart
-            updateChartData(portfolioChartSOL, history, (point) => [
-                point.sol,
-                point.totalValueSOL
-            ]);
+            // Chỉ cập nhật biểu đồ khi có điểm mới được thêm vào (mỗi giờ)
+            if (isNewPoint) {
+                // Update SOL chart
+                updateChartData(portfolioChartSOL, history, (point) => [
+                    point.sol,
+                    point.totalValueSOL
+                ]);
+                
+                // Update USDC chart
+                updateChartData(portfolioChartUSDC, history, (point) => [
+                    point.usdc,
+                    point.totalValueUSDC
+                ]);
+            }
+            // Nếu không có điểm mới, không cập nhật biểu đồ để tránh refresh không cần thiết
+            // Chỉ cập nhật text displays bên dưới
             
-            // Update USDC chart
-            updateChartData(portfolioChartUSDC, history, (point) => [
-                point.usdc,
-                point.totalValueUSDC
-            ]);
-            
-            // Cập nhật thông tin tổng giá trị
+            // Luôn cập nhật thông tin tổng giá trị (ngay cả khi không có điểm mới)
             const latest = history[history.length - 1];
             document.getElementById('total-value-sol').textContent = latest.totalValueSOL.toFixed(6) + ' SOL';
             document.getElementById('total-value-usdc').textContent = '$' + latest.totalValueUSDC.toFixed(2);
@@ -1085,11 +1092,13 @@
             }
             
             // Thêm điểm dữ liệu mới (chỉ thêm nếu là giờ mới)
-            const newPoint = addBalancePoint(balances, currentPrice);
-            if (!newPoint) {
+            const result = addBalancePoint(balances, currentPrice);
+            if (!result) {
                 // Không có dữ liệu hợp lệ, không cập nhật
                 return;
             }
+            
+            const { point, isNewPoint } = result;
             
             // Lấy lịch sử
             const history = getBalanceHistory();
@@ -1104,19 +1113,24 @@
                 return;
             }
             
-            // Update SOL chart
-            updateChartData(portfolioChartSOL, history, (point) => [
-                point.sol,
-                point.totalValueSOL
-            ]);
+            // Chỉ cập nhật biểu đồ khi có điểm mới được thêm vào (mỗi giờ)
+            if (isNewPoint) {
+                // Update SOL chart
+                updateChartData(portfolioChartSOL, history, (point) => [
+                    point.sol,
+                    point.totalValueSOL
+                ]);
+                
+                // Update USDC chart
+                updateChartData(portfolioChartUSDC, history, (point) => [
+                    point.usdc,
+                    point.totalValueUSDC
+                ]);
+            }
+            // Nếu không có điểm mới, không cập nhật biểu đồ để tránh refresh không cần thiết
+            // Chỉ cập nhật text displays bên dưới
             
-            // Update USDC chart
-            updateChartData(portfolioChartUSDC, history, (point) => [
-                point.usdc,
-                point.totalValueUSDC
-            ]);
-            
-            // Cập nhật thông tin tổng giá trị
+            // Luôn cập nhật thông tin tổng giá trị (ngay cả khi không có điểm mới)
             const latest = history[history.length - 1];
             document.getElementById('total-value-sol').textContent = latest.totalValueSOL.toFixed(6) + ' SOL';
             document.getElementById('total-value-usdc').textContent = '$' + latest.totalValueUSDC.toFixed(2);
