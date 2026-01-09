@@ -47,6 +47,7 @@ pub struct ApiConnectionStatus {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ApiResponse {
     pub balances: Vec<TokenBalance>,
+    pub initial_balances: Option<Vec<TokenBalance>>, // Số dư ban đầu khi bot khởi động
     pub bot_status: BotStatus,
     pub trades: Vec<TradeRecord>,
     pub current_price: Option<f64>,
@@ -82,6 +83,7 @@ pub struct BandPoint {
 #[derive(Clone)]
 pub struct AppState {
     pub balances: Arc<RwLock<Vec<TokenBalance>>>,
+    pub initial_balances: Arc<RwLock<Option<Vec<TokenBalance>>>>, // Số dư ban đầu khi bot khởi động
     pub bot_status: Arc<RwLock<BotStatus>>,
     pub trades: Arc<RwLock<Vec<TradeRecord>>>,
     pub current_price: Arc<RwLock<Option<f64>>>,
@@ -95,6 +97,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             balances: Arc::new(RwLock::new(Vec::new())),
+            initial_balances: Arc::new(RwLock::new(None)),
             bot_status: Arc::new(RwLock::new(BotStatus {
                 is_running: false,
                 wallet_address: String::new(),
@@ -119,6 +122,7 @@ impl AppState {
 // API endpoints
 pub async fn get_data(state: web::Data<AppState>) -> ActixResult<impl Responder> {
     let balances = state.balances.read().await.clone();
+    let initial_balances = state.initial_balances.read().await.clone();
     let bot_status = state.bot_status.read().await.clone();
     let trades = state.trades.read().await.clone();
     let current_price = *state.current_price.read().await;
@@ -128,6 +132,7 @@ pub async fn get_data(state: web::Data<AppState>) -> ActixResult<impl Responder>
 
     let response = ApiResponse {
         balances,
+        initial_balances,
         bot_status,
         trades,
         current_price,
@@ -154,72 +159,13 @@ pub async fn get_trades(state: web::Data<AppState>) -> ActixResult<impl Responde
     Ok(HttpResponse::Ok().json(trades))
 }
 
-// Ultra Swap API proxy endpoints
-pub async fn ultra_order(body: web::Json<serde_json::Value>) -> ActixResult<impl Responder> {
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.jup.ag/order/v1/order")
-        .json(&*body)
-        .send()
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Ultra Swap API error: {}", e)))?;
-    
-    let status = response.status();
-    let json: serde_json::Value = response.json().await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to parse response: {}", e)))?;
-    
-    Ok(HttpResponse::build(status).json(json))
-}
-
-pub async fn ultra_execute(body: web::Json<serde_json::Value>) -> ActixResult<impl Responder> {
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.jup.ag/order/v1/execute")
-        .json(&*body)
-        .send()
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Ultra Swap API error: {}", e)))?;
-    
-    let status = response.status();
-    let json: serde_json::Value = response.json().await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to parse response: {}", e)))?;
-    
-    Ok(HttpResponse::build(status).json(json))
-}
-
-pub async fn ultra_holdings(query: web::Query<std::collections::HashMap<String, String>>) -> ActixResult<impl Responder> {
-    let client = reqwest::Client::new();
-    let mut url = reqwest::Url::parse("https://api.jup.ag/order/v1/holdings").unwrap();
-    
-    // Thêm query parameters
-    for (key, value) in query.iter() {
-        url.query_pairs_mut().append_pair(key, value);
-    }
-    
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Ultra Swap API error: {}", e)))?;
-    
-    let status = response.status();
-    let json: serde_json::Value = response.json().await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to parse response: {}", e)))?;
-    
-    Ok(HttpResponse::build(status).json(json))
-}
-
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api")
             .route("/data", web::get().to(get_data))
             .route("/balances", web::get().to(get_balances))
             .route("/status", web::get().to(get_bot_status))
-            .route("/trades", web::get().to(get_trades))
-            // Ultra Swap API proxy endpoints
-            .route("/ultra/order", web::post().to(ultra_order))
-            .route("/ultra/execute", web::post().to(ultra_execute))
-            .route("/ultra/holdings", web::get().to(ultra_holdings)),
+            .route("/trades", web::get().to(get_trades)),
     );
 }
 

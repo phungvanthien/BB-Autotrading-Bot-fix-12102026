@@ -16,6 +16,12 @@ dotenv.config();
 const app = express();
 const PORT = 3001;
 
+const JUPITER_API_URL = 'https://lite-api.jup.ag';
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY;
+if (!JUPITER_API_KEY) {
+    throw new Error('JUPITER_API_KEY not found in .env');
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -170,6 +176,225 @@ async function initRaydium() {
         console.error('❌ Failed to initialize Raydium SDK:', error);
         return false;
     }
+}
+
+/**
+ * Get transaction info from transaction signature (ID)
+ * @param {string} signature - Transaction signature (ID)
+ * @returns {Promise<Object>} Transaction information
+ */
+async function getTransactionInfo(signature) {
+    try {
+        // Get parsed transaction (more readable)
+        const parsedTx = await connection.getParsedTransaction(signature, {
+            maxSupportedTransactionVersion: 0,
+        });
+        
+        if (!parsedTx) {
+            throw new Error('Transaction not found');
+        }
+        
+        return parsedTx;
+        
+    } catch (error) {
+        console.error(`❌ Error fetching transaction: ${error.message}`);
+        throw error;
+    }
+}
+
+/**
+ * Calculate detailed fees for a transaction (simplified - only returns totalFees)
+ * @param {Object} parsedTx - Parsed transaction object from getParsedTransaction
+ * @returns {Object} Total fees in lamports and SOL
+ */
+function calculateDetailedFees(parsedTx) {
+    if (!parsedTx || !parsedTx.meta) {
+        throw new Error('Invalid transaction data');
+    }
+
+    const meta = parsedTx.meta;
+    const transaction = parsedTx.transaction;
+    
+    // Base transaction fee (in lamports)
+    const baseFee = meta.fee || 0;
+    
+    // Priority fee (from compute budget instruction)
+    let priorityFee = 0;
+    let computeUnitPrice = null;
+    
+    // Check for compute budget instructions
+    transaction.message.instructions.forEach(ix => {
+        if (ix.programId === 'ComputeBudget111111111111111111111111111111') {
+            if (ix.parsed?.type === 'setComputeUnitPrice') {
+                computeUnitPrice = ix.parsed.info?.microLamports || 0;
+            }
+        }
+    });
+    
+    // Calculate priority fee: computeUnitPrice * computeUnitsConsumed
+    if (computeUnitPrice && meta.computeUnitsConsumed) {
+        priorityFee = Math.floor((computeUnitPrice * meta.computeUnitsConsumed) / 1_000_000);
+    }
+    
+    // Total fees paid (base fee + priority fee)
+    const totalFees = baseFee + priorityFee;
+    
+    return {
+        totalFees: {
+            lamports: totalFees,
+            sol: totalFees / 1e9,
+        },
+    };
+}
+
+/**
+ * Extract swap details (token in, token out) from transaction (simplified)
+ * @param {Object} parsedTx - Parsed transaction object from getParsedTransaction
+ * @returns {Object} Swap details with token in/out
+ */
+function extractSwapDetails(parsedTx) {
+    if (!parsedTx || !parsedTx.meta) {
+        throw new Error('Invalid transaction data');
+    }
+
+    const meta = parsedTx.meta;
+    const transaction = parsedTx.transaction;
+    
+    // Find the signer account
+    const signerAccount = transaction.message.accountKeys.find(acc => acc.signer);
+    const signerIndex = transaction.message.accountKeys.findIndex(acc => acc.signer);
+    
+    if (signerIndex === -1) {
+        throw new Error('No signer found in transaction');
+    }
+
+    const signerPubkey = signerAccount.pubkey.toString();
+    const SOL_MINT = 'So11111111111111111111111111111111111111112';
+    
+    // Track token balance changes for signer
+    const tokenChanges = [];
+    
+    // Map token balances by account index
+    const preTokenMap = new Map();
+    const postTokenMap = new Map();
+    
+    meta.preTokenBalances?.forEach(tokenBal => {
+        if (tokenBal.owner === signerPubkey) {
+            preTokenMap.set(tokenBal.accountIndex, tokenBal);
+        }
+    });
+    
+    meta.postTokenBalances?.forEach(tokenBal => {
+        if (tokenBal.owner === signerPubkey) {
+            postTokenMap.set(tokenBal.accountIndex, tokenBal);
+        }
+    });
+    
+    // Calculate token changes
+    const allTokenIndices = new Set([...preTokenMap.keys(), ...postTokenMap.keys()]);
+    allTokenIndices.forEach(accountIndex => {
+        const preToken = preTokenMap.get(accountIndex);
+        const postToken = postTokenMap.get(accountIndex);
+        
+        const preAmount = preToken?.uiTokenAmount?.uiAmount || 0;
+        const postAmount = postToken?.uiTokenAmount?.uiAmount || 0;
+        const change = postAmount - preAmount;
+        
+        // Only include tokens with actual changes
+        if (Math.abs(change) > 0.000001) {
+            tokenChanges.push({
+                accountIndex,
+                mint: preToken?.mint || postToken?.mint || 'Unknown',
+                preAmount,
+                postAmount,
+                change, // Positive = received, Negative = spent
+                decimals: preToken?.uiTokenAmount?.decimals || postToken?.uiTokenAmount?.decimals || 0,
+                rawPreAmount: preToken?.uiTokenAmount?.amount || '0',
+                rawPostAmount: postToken?.uiTokenAmount?.amount || '0',
+            });
+        }
+    });
+    
+    // Check SOL balance change for signer
+    const preSolBalance = meta.preBalances[signerIndex] || 0;
+    const postSolBalance = meta.postBalances[signerIndex] || 0;
+    const solChange = (postSolBalance - preSolBalance) / 1e9; // Convert to SOL
+    
+    // Identify input and output tokens
+    const inputTokens = []; // Tokens that decreased (spent)
+    const outputTokens = []; // Tokens that increased (received)
+    
+    // Process token changes
+    tokenChanges.forEach(token => {
+        if (token.change < 0) {
+            // Token decreased = input token
+            inputTokens.push({
+                mint: token.mint,
+                amount: Math.abs(token.change),
+                rawAmount: (BigInt(token.rawPreAmount) - BigInt(token.rawPostAmount)).toString(),
+                decimals: token.decimals,
+                accountIndex: token.accountIndex,
+            });
+        } else if (token.change > 0) {
+            // Token increased = output token
+            outputTokens.push({
+                mint: token.mint,
+                amount: token.change,
+                rawAmount: (BigInt(token.rawPostAmount) - BigInt(token.rawPreAmount)).toString(),
+                decimals: token.decimals,
+                accountIndex: token.accountIndex,
+            });
+        }
+    });
+    
+    // Handle SOL (native, not wrapped)
+    // If SOL balance decreased, it's an input
+    if (solChange < -0.000001) {
+        inputTokens.push({
+            mint: SOL_MINT,
+            amount: Math.abs(solChange),
+            rawAmount: (preSolBalance - postSolBalance).toString(),
+            decimals: 9,
+            accountIndex: signerIndex,
+            isNative: true,
+        });
+    } else if (solChange > 0.000001) {
+        // If SOL balance increased, it's an output
+        outputTokens.push({
+            mint: SOL_MINT,
+            amount: solChange,
+            rawAmount: (postSolBalance - preSolBalance).toString(),
+            decimals: 9,
+            accountIndex: signerIndex,
+            isNative: true,
+        });
+    }
+    
+    // Determine primary swap (largest amounts)
+    const primaryInput = inputTokens.length > 0 
+        ? inputTokens.reduce((max, token) => token.amount > max.amount ? token : max, inputTokens[0])
+        : null;
+    
+    const primaryOutput = outputTokens.length > 0
+        ? outputTokens.reduce((max, token) => token.amount > max.amount ? token : max, outputTokens[0])
+        : null;
+    
+    return {
+        tokenIn: primaryInput ? {
+            mint: primaryInput.mint,
+            amount: primaryInput.amount,
+            rawAmount: primaryInput.rawAmount,
+            decimals: primaryInput.decimals,
+            isNative: primaryInput.isNative || false,
+        } : null,
+        tokenOut: primaryOutput ? {
+            mint: primaryOutput.mint,
+            amount: primaryOutput.amount,
+            rawAmount: primaryOutput.rawAmount,
+            decimals: primaryOutput.decimals,
+            isNative: primaryOutput.isNative || false,
+        } : null,
+    };
 }
 
 // Health check endpoint
@@ -880,11 +1105,35 @@ app.post('/swap', async (req, res) => {
         console.log(`✅ Swap successful: ${txId}`);
         console.log(`   Output: ${outputAmount} ${outputMint}`);
         
+        // Analyze transaction to get actual swap details and fees
+        console.log(`   Analyzing transaction details...`);
+        let actualInputAmount = amountIn;
+        let actualOutputAmount = outputAmount.toString();
+        let feeInfo = null;
+        
+        try {
+            const txInfo = await getTransactionInfo(txId.toString());
+            const swapDetails = extractSwapDetails(txInfo);
+            const fees = calculateDetailedFees(txInfo);
+            
+            // Use actual amounts from transaction if available
+            if (swapDetails.tokenIn && swapDetails.tokenOut) {
+                actualInputAmount = swapDetails.tokenIn.amount.toString();
+                actualOutputAmount = swapDetails.tokenOut.amount.toString();
+            }
+            
+            feeInfo = fees.totalFees;
+        } catch (analysisError) {
+            console.warn(`   ⚠️  Could not analyze transaction: ${analysisError.message}`);
+            // Continue with original amounts if analysis fails
+        }
+        
         res.json({
             success: true,
             transactionSignature: txId.toString(),
-            inputAmount: amountIn,
-            outputAmount: outputAmount.toString(),
+            inputAmount: actualInputAmount,
+            outputAmount: actualOutputAmount,
+            fee: feeInfo,
         });
     } catch (error) {
         console.error('Swap error:', error);
@@ -938,10 +1187,12 @@ async function swapViaJupiter(req, res, inputMintPubkey, outputMintPubkey, amoun
     const slippageBps = Math.floor(slippage * 100);
     
     // Step 1: Get quote from Jupiter
-    const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMintPubkey.toString()}&outputMint=${outputMintPubkey.toString()}&amount=${amountInBaseUnits}&slippageBps=${slippageBps}`;
+    const quoteUrl = `${JUPITER_API_URL}/swap/v1/quote?inputMint=${inputMintPubkey.toString()}&outputMint=${outputMintPubkey.toString()}&amount=${amountInBaseUnits}&slippageBps=${slippageBps}`;
     
     console.log(`   Getting Jupiter quote: ${quoteUrl}`);
-    const quoteResponse = await fetch(quoteUrl);
+    const quoteResponse = await fetch(quoteUrl, {
+        headers: { 'x-api-key': JUPITER_API_KEY },
+    });
     const quoteData = await quoteResponse.json();
     
     if (quoteData.error) {
@@ -951,9 +1202,9 @@ async function swapViaJupiter(req, res, inputMintPubkey, outputMintPubkey, amoun
     console.log(`   Jupiter quote received: ${quoteData.outAmount} output tokens`);
     
     // Step 2: Get swap transaction
-    const swapResponse = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
+    const swapResponse = await fetch(`${JUPITER_API_URL}/swap/v1/swap`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-api-key': JUPITER_API_KEY },
         body: JSON.stringify({
             quoteResponse: quoteData,
             userPublicKey: owner.publicKey.toString(),
@@ -991,11 +1242,35 @@ async function swapViaJupiter(req, res, inputMintPubkey, outputMintPubkey, amoun
     const outputDecimals = raydium.token.tokenMap.get(outputMintPubkey.toString())?.decimals || 9;
     const outputAmount = Number(quoteData.outAmount) / Math.pow(10, outputDecimals);
     
+    // Analyze transaction to get actual swap details and fees
+    console.log(`   Analyzing transaction details...`);
+    let actualInputAmount = amountIn;
+    let actualOutputAmount = outputAmount.toString();
+    let feeInfo = null;
+    
+    try {
+        const txInfo = await getTransactionInfo(txid);
+        const swapDetails = extractSwapDetails(txInfo);
+        const fees = calculateDetailedFees(txInfo);
+        
+        // Use actual amounts from transaction if available
+        if (swapDetails.tokenIn && swapDetails.tokenOut) {
+            actualInputAmount = swapDetails.tokenIn.amount.toString();
+            actualOutputAmount = swapDetails.tokenOut.amount.toString();
+        }
+        
+        feeInfo = fees.totalFees;
+    } catch (analysisError) {
+        console.warn(`   ⚠️  Could not analyze transaction: ${analysisError.message}`);
+        // Continue with original amounts if analysis fails
+    }
+    
     res.json({
         success: true,
         transactionSignature: txid,
-        inputAmount: amountIn,
-        outputAmount: outputAmount.toString(),
+        inputAmount: actualInputAmount,
+        outputAmount: actualOutputAmount,
+        fee: feeInfo,
         provider: 'Jupiter (fallback)',
     });
 }

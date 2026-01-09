@@ -288,7 +288,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
-    // Cập nhật số dư định kỳ (ngay lập tức và sau đó mỗi 30 giây)
+    // Cập nhật số dư định kỳ (ngay lập tức và sau đó mỗi 1 giờ)
     let app_state_balance = app_state.clone();
     let keypair_balance_buf = keypair_buf.clone();
     
@@ -303,7 +303,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(3600)); // 1 hour = 3600 seconds
         loop {
             interval.tick().await;
             let kp = Keypair::from_bytes(&keypair_balance_buf).unwrap();
@@ -764,6 +764,15 @@ async fn update_balances(
         }
         Err(e) => {
             eprintln!("⚠️  Failed to get USDC balance: {}", e);
+        }
+    }
+    
+    // Lưu số dư ban đầu nếu chưa có
+    {
+        let mut initial_balances = app_state.initial_balances.write().await;
+        if initial_balances.is_none() {
+            *initial_balances = Some(balances.clone());
+            println!("📊 Initial balances saved");
         }
     }
     
