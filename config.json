@@ -6,11 +6,16 @@
             "output_mint": "So11111111111111111111111111111111111111112",
             "base_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             "quote_mint": "So11111111111111111111111111111111111111112",
-            "buy_amount": 0.1,
-            "sell_amount": 0.1,
+            "buy_amount": 0.5,
+            "sell_amount": 0.5,
             "period": 20,
             "std_dev": 2.0,
-            "check_interval_seconds": 60
+            "check_interval_seconds": 300,
+            "initial_bands": {
+                "upper_band": 136.33,
+                "middle_band": 136.22,
+                "lower_band": 136.10
+            }
         }
     ]
 }

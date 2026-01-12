@@ -89,7 +89,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         status.last_update = Utc::now();
         status.api_status = ApiConnectionStatus {
             rpc_endpoint: "checking".to_string(),
-            raydium_service: "checking".to_string(),
+            jupiter_service: "checking".to_string(),
             last_check: Utc::now(),
             rpc_url: None,
         };
@@ -246,14 +246,31 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Tạo price history cho job này
             let period = conditional_job.period;
-            let price_history = Arc::new(Mutex::new(PriceHistory::new(period)));
+            let timeframe_minutes = conditional_job.check_interval_seconds / 60; // Chuyển từ giây sang phút
+            let price_history = if let Some(ref initial_bands) = conditional_job.initial_bands {
+                println!("📊 Khởi tạo Bollinger Bands với giá trị thủ công:");
+                println!("   Upper Band: {:.4}", initial_bands.upper_band);
+                println!("   Middle Band: {:.4}", initial_bands.middle_band);
+                println!("   Lower Band: {:.4}", initial_bands.lower_band);
+                println!("   → Bot sẽ có thể chạy ngay lập tức!");
+                let mut history = PriceHistory::new_with_initial_bands(
+                    period,
+                    initial_bands,
+                    conditional_job.std_dev,
+                );
+                // Cập nhật timeframe từ config
+                history.timeframe_minutes = timeframe_minutes;
+                Arc::new(Mutex::new(history))
+            } else {
+                Arc::new(Mutex::new(PriceHistory::new_with_timeframe(period, timeframe_minutes)))
+            };
 
             let kp_buf = keypair_buf.clone();
             let job_clone = conditional_job.clone();
             let price_history_clone = price_history.clone();
             let app_state_clone = app_state.clone();
 
-            // Tạo task kiểm tra định kỳ (nến 1 phút = 60 giây)
+            // Tạo task kiểm tra định kỳ (nến 5 phút = 300 giây)
             let body = move || {
                 let kp_buf_inner = kp_buf.clone();
                 let kp = Keypair::from_bytes(&kp_buf_inner).unwrap();
@@ -271,12 +288,27 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // Nến 1 phút = kiểm tra mỗi 60 giây
+            // Nến 5 phút = kiểm tra mỗi 5 phút
             // Format: second minute hour day month weekday
-            // Chạy mỗi 60 giây = mỗi phút ở giây 0
-            let cron_str = "0 * * * * *".to_string();
+            // Chạy mỗi 5 phút ở giây 0: "0 */5 * * * *"
+            // Hoặc sử dụng check_interval_seconds từ config nếu có
+            let interval_seconds = conditional_job.check_interval_seconds;
+            let cron_str = if interval_seconds >= 60 {
+                // Nếu >= 60 giây, tính số phút
+                let minutes = interval_seconds / 60;
+                if minutes == 1 {
+                    "0 * * * * *".to_string() // Mỗi phút
+                } else {
+                    format!("0 */{} * * * *", minutes) // Mỗi N phút
+                }
+            } else {
+                // Nếu < 60 giây, chạy mỗi N giây (không khuyến nghị)
+                format!("*/{} * * * * *", interval_seconds)
+            };
 
-            println!("Building conditional task {} with 1-minute candle interval (every 60 seconds)", i + 1);
+            println!("Building conditional task {} with {}-minute candle interval (every {} seconds)", 
+                     i + 1, interval_seconds / 60, interval_seconds);
+            println!("   📅 Cron string: {}", cron_str);
 
             let task = TaskBuilder::default()
                 .set_task_id(i.try_into().unwrap())
@@ -302,8 +334,21 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
+    // Cập nhật số dư sau 10 giây khi khởi động (để đảm bảo RPC sẵn sàng)
+    let app_state_delayed = app_state.clone();
+    let keypair_delayed_buf = keypair_buf.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(3600)); // 1 hour = 3600 seconds
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let kp = Keypair::from_bytes(&keypair_delayed_buf).unwrap();
+        if let Err(e) = update_balances(&app_state_delayed, &kp).await {
+            eprintln!("⚠️  Error updating balances after startup: {}", e);
+        } else {
+            println!("✅ Balances updated after startup (10 seconds delay)");
+        }
+    });
+    
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes = 300 seconds (thay vì 1 giờ)
         loop {
             interval.tick().await;
             let kp = Keypair::from_bytes(&keypair_balance_buf).unwrap();
@@ -539,8 +584,14 @@ fn log_transaction_to_csv(
     Ok(())
 }
 
-#[derive(Deserialize, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+struct InitialBands {
+    upper_band: f64,
+    middle_band: f64,
+    lower_band: f64,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
 struct ConditionalJob {
     #[serde(rename = "type")]
     job_type: String, // "bollinger_bands"
@@ -553,13 +604,17 @@ struct ConditionalJob {
     period: usize, // Số kỳ cho Bollinger Bands (mặc định 20)
     std_dev: f64, // Độ lệch chuẩn (mặc định 2.0)
     check_interval_seconds: u64, // Khoảng thời gian kiểm tra (giây)
+    #[serde(default)]
+    initial_bands: Option<InitialBands>, // Giá trị Bollinger Bands ban đầu (tùy chọn)
 }
 
 // Lưu trữ lịch sử giá cho Bollinger Bands (kèm timestamp)
 struct PriceHistory {
     prices: Vec<PricePoint>,
     period: usize,     // số kỳ để tính Bollinger
-    max_store: usize,  // số điểm lưu tối đa để hiển thị (vd 60 phút)
+    max_store: usize,  // số điểm lưu tối đa để hiển thị (vd 60 điểm = 5 giờ với timeframe 5 phút)
+    last_added_time: Option<DateTime<Utc>>, // Thời gian thêm giá cuối cùng
+    timeframe_minutes: u64, // Timeframe (phút) - mặc định 5 phút
 }
 
 impl PriceHistory {
@@ -569,13 +624,90 @@ impl PriceHistory {
             prices: Vec::with_capacity(max_store),
             period,
             max_store,
+            last_added_time: None,
+            timeframe_minutes: 5, // Mặc định 5 phút
+        }
+    }
+    
+    // Tạo mới với timeframe tùy chỉnh
+    fn new_with_timeframe(period: usize, timeframe_minutes: u64) -> Self {
+        let max_store = 60_usize.max(period);
+        Self {
+            prices: Vec::with_capacity(max_store),
+            period,
+            max_store,
+            last_added_time: None,
+            timeframe_minutes,
+        }
+    }
+    
+    // Khởi tạo với giá trị Bollinger Bands ban đầu
+    // Tạo đủ số lượng giá giả lập để khi tính Bollinger Bands sẽ ra đúng giá trị đã nhập
+    fn new_with_initial_bands(period: usize, initial_bands: &InitialBands, std_dev: f64) -> Self {
+        let max_store = 60_usize.max(period);
+        let timeframe_minutes = 5; // Timeframe 5 phút
+        let mut prices = Vec::with_capacity(max_store);
+        
+        // Tính toán độ lệch chuẩn từ các giá trị đã cho
+        // upper_band = middle_band + (std_dev * std)
+        // lower_band = middle_band - (std_dev * std)
+        // Lấy trung bình của 2 giá trị để đảm bảo tính nhất quán
+        let std_upper = (initial_bands.upper_band - initial_bands.middle_band) / std_dev;
+        let std_lower = (initial_bands.middle_band - initial_bands.lower_band) / std_dev;
+        let std = (std_upper + std_lower) / 2.0;
+        
+        // Tạo đủ period giá giả lập xung quanh middle_band
+        // Để khi tính Bollinger Bands sẽ ra đúng giá trị đã nhập
+        // Sử dụng phân phối chuẩn với độ lệch chuẩn đã tính
+        let now = Utc::now();
+        for i in 0..period {
+            // Tạo giá dao động xung quanh middle_band
+            // Sử dụng phân phối chuẩn giả lập với độ lệch chuẩn std
+            // Tạo giá từ -2*std đến +2*std để bao phủ toàn bộ phạm vi
+            let normalized_pos = (i as f64 / (period - 1) as f64) * 2.0 - 1.0; // Từ -1 đến +1
+            let z_score = normalized_pos * 2.0; // Từ -2 đến +2 (bao phủ ~95% phân phối chuẩn)
+            let offset = z_score * std;
+            let price = initial_bands.middle_band + offset;
+            
+            // Tính timestamp giả lập (mỗi giá cách nhau 5 phút cho timeframe 5 phút)
+            let timestamp = now - chrono::Duration::minutes((period - i) as i64 * timeframe_minutes as i64);
+            prices.push(PricePoint { price, timestamp });
+        }
+        
+        Self {
+            prices,
+            period,
+            max_store,
+            last_added_time: Some(now),
+            timeframe_minutes,
         }
     }
 
     fn add_price(&mut self, price: f64, timestamp: DateTime<Utc>) {
-        self.prices.push(PricePoint { price, timestamp });
-        if self.prices.len() > self.max_store {
-            self.prices.remove(0);
+        // Chỉ thêm giá nếu đã đủ timeframe (mặc định 5 phút) kể từ lần thêm cuối
+        let should_add = match self.last_added_time {
+            None => true, // Chưa có giá nào, thêm ngay
+            Some(last_time) => {
+                let elapsed = timestamp.signed_duration_since(last_time);
+                let elapsed_minutes = elapsed.num_minutes();
+                let required_minutes = self.timeframe_minutes as i64;
+                elapsed_minutes >= required_minutes
+            }
+        };
+        
+        if should_add {
+            self.prices.push(PricePoint { price, timestamp });
+            self.last_added_time = Some(timestamp);
+            if self.prices.len() > self.max_store {
+                self.prices.remove(0);
+            }
+        } else {
+            // Nếu chưa đủ timeframe, cập nhật giá cuối cùng thay vì thêm mới
+            // Điều này đảm bảo mỗi nến chỉ có 1 giá (giá cuối cùng trong khoảng thời gian đó)
+            if let Some(last_point) = self.prices.last_mut() {
+                last_point.price = price;
+                last_point.timestamp = timestamp;
+            }
         }
     }
 
@@ -829,10 +961,17 @@ async fn handle_bollinger_bands_job(
     let (bands_opt, prices_snapshot, count) = {
         let mut history = price_history.lock().await;
         let now = Utc::now();
+        let was_added = history.prices.len();
         history.add_price(current_price, now);
         let count = history.prices.len();
-        println!("📊 Price history: {}/{} prices collected", count, job.period);
-        // Snapshot giá kèm timestamp để lưu (cap 60 điểm)
+        let actually_added = count > was_added;
+        if actually_added {
+            println!("📊 Price history: {}/{} prices collected (✅ Added new candle)", count, job.period);
+        } else {
+            println!("📊 Price history: {}/{} prices collected (⏸️  Updated existing candle - waiting for {} min timeframe)", 
+                     count, job.period, history.timeframe_minutes);
+        }
+        // Snapshot giá kèm timestamp để lưu (cap 60 điểm = 5 giờ với timeframe 5 phút)
         // Lấy 60 điểm gần nhất, giữ nguyên thứ tự thời gian (cũ -> mới)
         let prices_snapshot: Vec<PricePoint> = if history.prices.len() > 60 {
             history.prices.iter().skip(history.prices.len() - 60).cloned().collect()
@@ -850,7 +989,7 @@ async fn handle_bollinger_bands_job(
             println!("⏳ Chưa đủ dữ liệu để tính Bollinger Bands (cần {} giá, hiện có {})", job.period, count);
 
             // Lưu history để vẽ (bands rỗng)
-            // Lưu tối đa 60 điểm để biểu đồ 60 phút
+            // Lưu tối đa 60 điểm để biểu đồ 5 giờ (với timeframe 5 phút)
             *app_state.price_history.write().await = prices_snapshot.clone();
 
             let mut band_history = app_state.band_history.write().await;
@@ -903,8 +1042,8 @@ async fn handle_bollinger_bands_job(
         status.last_update = Utc::now();
     }
 
-    // Kiểm tra cooldown để tránh swap liên tục (tối thiểu 60 giây giữa các lần swap)
-    const MIN_SWAP_INTERVAL_SECS: u64 = 60;
+    // Kiểm tra cooldown để tránh swap liên tục (tối thiểu 5 phút = 300 giây giữa các lần swap)
+    const MIN_SWAP_INTERVAL_SECS: u64 = 300;
     {
         let last_swap = app_state.last_swap_time.read().await;
         if let Some(last_time) = *last_swap {
@@ -923,9 +1062,14 @@ async fn handle_bollinger_bands_job(
     // - output_mint = SOL (So11111111111111111111111111111111111111112)
     // - current_price = giá SOL/USDC (ví dụ: 150 nghĩa là 1 SOL = 150 USDC)
     
-    if current_price <= lower_band {
-        // Mua SOL khi giá đóng nến dưới band dưới
-        println!("🚀 TÍN HIỆU MUA: Giá ({:.4}) <= BB Lower ({:.4})", current_price, lower_band);
+    // Thêm buffer để tránh giao dịch quá sớm
+    // Chỉ mua khi giá < Lower Band - 0.1% để đảm bảo có đủ biên độ lợi nhuận
+    let buy_threshold = lower_band * 0.999; // Lower Band - 0.1%
+    
+    if current_price <= buy_threshold {
+        // Mua SOL khi giá đóng nến dưới ngưỡng mua (Lower Band - 0.1%)
+        println!("🚀 TÍN HIỆU MUA: Giá ({:.4}) <= Buy Threshold ({:.4}, Lower Band: {:.4})", 
+                 current_price, buy_threshold, lower_band);
         
         // Sử dụng buy_amount từ config (số lượng SOL)
         let sol_amount = job.buy_amount;
@@ -936,17 +1080,57 @@ async fn handle_bollinger_bands_job(
         
         println!("   → Mua {} SOL từ USDC (cần {} USDC)", sol_amount, usdc_needed);
         
+        // Kiểm tra số dư USDC trước khi swap
+        let rpc_client = RpcClient::new_with_commitment(
+            "https://api.mainnet-beta.solana.com".into(),
+            CommitmentConfig::confirmed(),
+        );
+        let usdc_mint = Pubkey::try_from(job.input_mint.as_str())?;
+        let usdc_address = get_associated_token_address(&keypair.pubkey(), &usdc_mint);
+        let usdc_balance = match rpc_client.get_token_account(&usdc_address).await {
+            Ok(Some(acc)) => acc.token_amount.ui_amount.unwrap_or(0.0),
+            Ok(None) => {
+                eprintln!("   ⚠️  Token account USDC chưa được khởi tạo!");
+                eprintln!("   → Đang khởi tạo token account...");
+                if let Err(e) = maybe_init_token_account(&rpc_client, &keypair, usdc_mint).await {
+                    eprintln!("   ❌ Không thể khởi tạo token account: {}", e);
+                    return Ok(());
+                }
+                // Sau khi khởi tạo, kiểm tra lại
+                match rpc_client.get_token_account(&usdc_address).await {
+                    Ok(Some(acc)) => acc.token_amount.ui_amount.unwrap_or(0.0),
+                    _ => 0.0,
+                }
+            }
+            Err(e) => {
+                eprintln!("   ⚠️  Không thể kiểm tra số dư USDC: {}", e);
+                0.0
+            }
+        };
+        
+        if usdc_balance < usdc_needed {
+            eprintln!("   ❌ Không đủ USDC! Cần {} USDC nhưng chỉ có {} USDC", usdc_needed, usdc_balance);
+            eprintln!("   → Bỏ qua lệnh mua này");
+            return Ok(());
+        }
+        
+        println!("   ✅ Số dư USDC: {} (đủ để mua)", usdc_balance);
+        
+        // Lưu keypair bytes để cập nhật số dư sau swap
+        let keypair_bytes = keypair.to_bytes().to_vec();
+        
         let result = swap_with_record(
             input_mint,  // USDC
             output_mint, // SOL
             usdc_needed, // Số lượng USDC
-            1.0,         // Slippage 1%
+            1.5,         // Slippage 1.5% (tăng để giảm số lần thất bại)
             keypair,
             "BUY".to_string(),
             current_price,
             upper_band,
             lower_band,
             app_state.clone(),
+            keypair_bytes, // Thêm keypair bytes
         ).await;
         
         match result {
@@ -961,25 +1145,97 @@ async fn handle_bollinger_bands_job(
             }
         }
         
-    } else if current_price >= upper_band {
-        // Bán SOL khi giá đóng nến trên band trên
-        println!("📉 TÍN HIỆU BÁN: Giá ({:.4}) >= BB Upper ({:.4})", current_price, upper_band);
+    } else {
+        // Thêm buffer và kiểm tra spread trước khi bán
+        // Chỉ bán khi giá > Upper Band + 0.1% để đảm bảo có đủ biên độ lợi nhuận
+        let sell_threshold = upper_band * 1.001; // Upper Band + 0.1%
+        
+        // Kiểm tra spread: cần đảm bảo giá bán cao hơn giá mua trung bình ít nhất 0.2%
+        // Để bù đắp phí giao dịch và slippage
+        let min_profit_spread = 0.002; // 0.2% spread tối thiểu
+        
+        if current_price >= sell_threshold {
+        // Kiểm tra xem có đủ spread để có lợi nhuận không
+        // Lấy giá mua trung bình từ lịch sử giao dịch gần đây
+        let recent_buy_price = {
+            let trades = app_state.trades.read().await;
+            let buy_trades: Vec<_> = trades.iter()
+                .filter(|t| t.order_type == "BUY" && t.status == "SUCCESS")
+                .rev()
+                .take(5) // Lấy 5 giao dịch mua gần nhất
+                .collect();
+            
+            if !buy_trades.is_empty() {
+                let avg_buy_price: f64 = buy_trades.iter()
+                    .map(|t| t.price)
+                    .sum::<f64>() / buy_trades.len() as f64;
+                Some(avg_buy_price)
+            } else {
+                None
+            }
+        };
+        
+        // Kiểm tra spread
+        if let Some(avg_buy) = recent_buy_price {
+            let spread = (current_price - avg_buy) / avg_buy;
+            if spread < min_profit_spread {
+                println!("⏸️  TÍN HIỆU BÁN NHƯNG KHÔNG ĐỦ SPREAD:");
+                println!("   Giá hiện tại: {:.4}", current_price);
+                println!("   Giá mua trung bình: {:.4}", avg_buy);
+                println!("   Spread: {:.4}% (cần ít nhất {:.2}%)", spread * 100.0, min_profit_spread * 100.0);
+                println!("   → Bỏ qua lệnh bán để tránh lỗ do phí và slippage");
+                return Ok(());
+            }
+            println!("✅ Spread đủ: {:.4}% (cần ít nhất {:.2}%)", spread * 100.0, min_profit_spread * 100.0);
+        }
+        
+        // Bán SOL khi giá đóng nến trên ngưỡng bán (Upper Band + 0.1%)
+        println!("📉 TÍN HIỆU BÁN: Giá ({:.4}) >= Sell Threshold ({:.4}, Upper Band: {:.4})", 
+                 current_price, sell_threshold, upper_band);
         
         // Sử dụng sell_amount từ config
         let sol_amount = job.sell_amount;
         println!("   → Bán {} SOL để lấy USDC", sol_amount);
         
+        // Kiểm tra số dư SOL trước khi swap
+        let rpc_client = RpcClient::new_with_commitment(
+            "https://api.mainnet-beta.solana.com".into(),
+            CommitmentConfig::confirmed(),
+        );
+        let sol_balance = match rpc_client.get_balance(&keypair.pubkey()).await {
+            Ok(balance) => amount_to_ui_amount(balance, native_mint::DECIMALS),
+            Err(e) => {
+                eprintln!("   ⚠️  Không thể kiểm tra số dư SOL: {}", e);
+                0.0
+            }
+        };
+        
+        // Cần thêm một chút SOL để trả phí giao dịch (~0.000005 SOL)
+        let min_sol_needed = sol_amount + 0.001; // Thêm buffer cho phí
+        
+        if sol_balance < min_sol_needed {
+            eprintln!("   ❌ Không đủ SOL! Cần {} SOL (bao gồm phí) nhưng chỉ có {} SOL", min_sol_needed, sol_balance);
+            eprintln!("   → Bỏ qua lệnh bán này");
+            return Ok(());
+        }
+        
+        println!("   ✅ Số dư SOL: {} (đủ để bán)", sol_balance);
+        
+        // Lưu keypair bytes để cập nhật số dư sau swap
+        let keypair_bytes = keypair.to_bytes().to_vec();
+        
         let result = swap_with_record(
             output_mint, // SOL (bán)
             input_mint,  // USDC (nhận)
             sol_amount,  // Số lượng SOL
-            1.0,         // Slippage 1%
+            1.5,         // Slippage 1.5% (tăng để giảm số lần thất bại)
             keypair,
             "SELL".to_string(),
             current_price,
             upper_band,
             lower_band,
             app_state.clone(),
+            keypair_bytes, // Thêm keypair bytes
         ).await;
         
         match result {
@@ -993,10 +1249,11 @@ async fn handle_bollinger_bands_job(
                 eprintln!("   → Bot sẽ thử lại ở lần kiểm tra tiếp theo");
             }
         }
-    } else {
-        println!("⏸️  Giá ({:.4}) trong phạm vi Bollinger Bands [Lower: {:.4}, Upper: {:.4}]", 
-                 current_price, lower_band, upper_band);
-        println!("   → Không thực hiện giao dịch");
+        } else {
+            println!("⏸️  Giá ({:.4}) trong phạm vi Bollinger Bands [Lower: {:.4}, Upper: {:.4}]", 
+                     current_price, lower_band, upper_band);
+            println!("   → Không thực hiện giao dịch");
+        }
     }
 
     Ok(())
@@ -1014,6 +1271,7 @@ async fn swap_with_record(
     upper_band: f64,
     lower_band: f64,
     app_state: AppState,
+    keypair_bytes: Vec<u8>, // Thêm keypair bytes để cập nhật số dư sau swap
 ) -> Result<String> {
     let start_time = Utc::now();
     let mut transaction_signature = String::new();
@@ -1112,6 +1370,24 @@ async fn swap_with_record(
     // Note: keypair đã được move vào swap, nên không thể dùng lại ở đây
     // Sẽ được cập nhật bởi background task
     
+    // Cập nhật số dư ngay sau khi swap thành công
+    if result.is_ok() {
+        // Đợi một chút để transaction được confirm
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        
+        // Tạo lại keypair từ bytes để cập nhật số dư
+        let kp = Keypair::from_bytes(&keypair_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to recreate keypair: {}", e))?;
+        
+        // Cập nhật số dư ngay lập tức
+        if let Err(e) = update_balances(&app_state, &kp).await {
+            eprintln!("   ⚠️  Không thể cập nhật số dư ngay lập tức: {}", e);
+            eprintln!("   → Số dư sẽ được cập nhật trong lần kiểm tra tiếp theo");
+        } else {
+            println!("   ✅ Đã cập nhật số dư sau swap");
+        }
+    }
+    
     match result {
         Ok(_) => Ok(transaction_signature),
         Err(e) => Err(e),
@@ -1179,57 +1455,32 @@ async fn check_api_connections(app_state: &AppState, wallet_address: Pubkey) {
         )
     };
     
-    // Kiểm tra Raydium service
-    let raydium_status = {
-        println!("  → Kiểm tra Raydium service...");
-        const RAYDIUM_SERVICE_URL: &str = "http://localhost:3001";
+    // Kiểm tra Jupiter service
+    let jupiter_status = {
+        println!("  → Kiểm tra Jupiter service...");
+        const JUPITER_SERVICE_URL: &str = "http://localhost:3002";
         
         match tokio::time::timeout(
             Duration::from_secs(5),
             reqwest::Client::new()
-                .get(&format!("{}/health", RAYDIUM_SERVICE_URL))
+                .get(&format!("{}/health", JUPITER_SERVICE_URL))
                 .send()
         ).await {
             Ok(Ok(resp)) => {
                 if resp.status().is_success() {
-                    // Đọc text trước, rồi parse JSON
-                    match resp.text().await {
-                        Ok(text) => {
-                            match serde_json::from_str::<serde_json::Value>(&text) {
-                                Ok(json) => {
-                                    let initialized = json.get("raydium_initialized")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    if initialized {
-                                        println!("  ✅ Raydium service: Kết nối thành công và SDK đã khởi tạo");
-                                        "connected".to_string()
-                                    } else {
-                                        println!("  ⚠️  Raydium service: Kết nối được nhưng SDK chưa khởi tạo. Response: {}", text);
-                                        "disconnected".to_string()
-                                    }
-                                },
-                                Err(e) => {
-                                    eprintln!("  ⚠️  Raydium service: Không parse được JSON: {}. Response: {}", e, text);
-                                    "disconnected".to_string()
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("  ⚠️  Raydium service: Không đọc được response text: {}", e);
-                            "disconnected".to_string()
-                        }
-                    }
+                    println!("  ✅ Jupiter service: Kết nối thành công");
+                    "connected".to_string()
                 } else {
-                    eprintln!("  ❌ Raydium service: HTTP status {}", resp.status());
+                    eprintln!("  ❌ Jupiter service: HTTP status {}", resp.status());
                     "disconnected".to_string()
                 }
             },
             Ok(Err(e)) => {
-                eprintln!("  ❌ Raydium service: Lỗi kết nối - {}", e);
+                eprintln!("  ❌ Jupiter service: Lỗi kết nối - {}", e);
                 "disconnected".to_string()
             },
             Err(_) => {
-                eprintln!("  ❌ Raydium service: Timeout sau 5 giây");
+                eprintln!("  ❌ Jupiter service: Timeout sau 5 giây");
                 "disconnected".to_string()
             },
         }
@@ -1240,7 +1491,7 @@ async fn check_api_connections(app_state: &AppState, wallet_address: Pubkey) {
         let mut status = app_state.bot_status.write().await;
         status.api_status = ApiConnectionStatus {
             rpc_endpoint: rpc_status.clone(),
-            raydium_service: raydium_status.clone(),
+            jupiter_service: jupiter_status.clone(),
             last_check: Utc::now(),
             rpc_url: rpc_url.clone(),
         };
@@ -1248,24 +1499,17 @@ async fn check_api_connections(app_state: &AppState, wallet_address: Pubkey) {
     
     println!("🔍 Kết quả kiểm tra API:");
     println!("   - RPC Endpoint: {} ({:?})", rpc_status, rpc_url);
-    println!("   - Raydium Service: {}", raydium_status);
-    
-    // Debug: Kiểm tra xem state đã được cập nhật chưa
-    {
-        let status = app_state.bot_status.read().await;
-        println!("   📊 State sau khi cập nhật:");
-        println!("      - raydium_service trong state: {}", status.api_status.raydium_service);
-    }
+    println!("   - Jupiter Service: {}", jupiter_status);
     
     // Kiểm tra xem có sẵn sàng swap không
-    if raydium_status == "connected" && rpc_status == "connected" {
+    if jupiter_status == "connected" && rpc_status == "connected" {
         println!("✅ Sẵn sàng swap!");
     } else {
         eprintln!("⚠️  Chưa sẵn sàng swap - Kiểm tra kết nối mạng và DNS");
     }
 }
 
-// Hàm swap chính - Sử dụng Jupiter làm primary, Raydium làm fallback
+// Hàm swap chính - Chỉ sử dụng Jupiter
 async fn swap(
     input_mint: Pubkey,
     output_mint: Pubkey,
@@ -1273,154 +1517,10 @@ async fn swap(
     slippage: f64,
     _keypair: Keypair,
 ) -> Result<SwapResult> {
-    // Try Jupiter first (more reliable)
-    match swap_via_jupiter_service(input_mint, output_mint, ui_amount, slippage).await {
-        Ok(result) => Ok(result),
-        Err(jupiter_err) => {
-            eprintln!("⚠️  Jupiter swap failed: {}, falling back to Raydium...", jupiter_err);
-            swap_via_raydium(input_mint, output_mint, ui_amount, slippage).await
-        }
-    }
+    swap_via_jupiter_service(input_mint, output_mint, ui_amount, slippage).await
 }
 
-// Swap qua Raydium service
-async fn swap_via_raydium(
-    input_mint: Pubkey,
-    output_mint: Pubkey,
-    ui_amount: f64,
-    slippage: f64,
-) -> Result<SwapResult> {
-    const RAYDIUM_SERVICE_URL: &str = "http://localhost:3001";
-    
-    println!("🔄 Attempting swap via Raydium service...");
-    println!("   Input: {} {} -> Output: {}", ui_amount, input_mint, output_mint);
-    
-    let client = reqwest::Client::new();
-    
-    // Kiểm tra health trước
-    match client.get(&format!("{}/health", RAYDIUM_SERVICE_URL))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                println!("✅ Raydium service is available");
-            } else {
-                return Err(anyhow::anyhow!("Raydium service health check failed"));
-            }
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!("Cannot connect to Raydium service: {}. Make sure service is running on port 3001", e));
-        }
-    }
-    
-    // Thực hiện swap
-    let request_body = serde_json::json!({
-        "inputMint": input_mint.to_string(),
-        "outputMint": output_mint.to_string(),
-        "amountIn": ui_amount.to_string(),
-        "slippage": slippage
-    });
-    
-    println!("📤 Sending swap request to Raydium service:");
-    println!("   {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()));
-    
-    let start_time = std::time::Instant::now();
-    let response = client
-        .post(&format!("{}/swap", RAYDIUM_SERVICE_URL))
-        .json(&request_body)
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| {
-            eprintln!("❌ Failed to send request to Raydium service: {}", e);
-            anyhow::anyhow!("Raydium service request failed: {}", e)
-        })?;
-    
-    let latency_ms = start_time.elapsed().as_millis() as u64;
-    let status_code = response.status().as_u16();
-    
-    if !response.status().is_success() {
-        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        eprintln!("❌ Raydium service HTTP error ({}): {}", status_code, error_text);
-        return Ok(SwapResult {
-            txid: "failed".to_string(),
-            provider: "fallback".to_string(),
-            amount_in: ui_amount,
-            amount_out: 0.0,
-            expected_out: None,
-            status_code,
-            error_message: Some(error_text),
-            latency_ms,
-        });
-    }
-    
-    let result: serde_json::Value = response.json().await
-        .map_err(|e| {
-            eprintln!("❌ Failed to parse Raydium response JSON: {}", e);
-            anyhow::anyhow!("Failed to parse Raydium response: {}", e)
-        })?;
-    
-    // Debug: log full response
-    println!("📋 Raydium service response: {}", serde_json::to_string_pretty(&result).unwrap_or_else(|_| "Failed to serialize".to_string()));
-    
-    if let Some(success) = result.get("success").and_then(|s| s.as_bool()) {
-        if success {
-            let tx_sig = result.get("transactionSignature")
-                .and_then(|s| s.as_str())
-                .ok_or_else(|| {
-                    eprintln!("❌ Response missing transactionSignature field");
-                    anyhow::anyhow!("No transaction signature in response")
-                })?;
-            
-            let amount_out = result.get("outputAmount")
-                .and_then(|a| a.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            
-            println!("✅ Raydium swap successful: {}", tx_sig);
-            return Ok(SwapResult {
-                txid: tx_sig.to_string(),
-                provider: "fallback".to_string(), // Raydium is fallback
-                amount_in: ui_amount,
-                amount_out,
-                expected_out: None, // Raydium doesn't provide expected output in response
-                status_code: 200,
-                error_message: None,
-                latency_ms,
-            });
-        }
-    }
-    
-    // Extract error message
-    let error_msg_str = result.get("error")
-        .and_then(|e| e.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            let json_str = serde_json::to_string(&result).unwrap_or_else(|_| "Unknown error".to_string());
-            json_str
-        });
-    eprintln!("❌ Raydium swap failed: {}", error_msg_str);
-    
-    // Fallback to Jupiter API if Raydium fails
-    if error_msg_str.contains("fetch vault info error") || error_msg_str.contains("vault") {
-        eprintln!("⚠️  Raydium vault error detected, falling back to Jupiter API...");
-        return swap_via_jupiter_service(input_mint, output_mint, ui_amount, slippage).await;
-    }
-    
-    Ok(SwapResult {
-        txid: "failed".to_string(),
-        provider: "fallback".to_string(),
-        amount_in: ui_amount,
-        amount_out: 0.0,
-        expected_out: None,
-        status_code,
-        error_message: Some(error_msg_str),
-        latency_ms,
-    })
-}
-
-// Primary: Swap via Jupiter service
+// Swap via Jupiter service
 async fn swap_via_jupiter_service(
     input_mint: Pubkey,
     output_mint: Pubkey,

@@ -145,6 +145,20 @@
         .trades-table tr:hover {
             background: #f8f9fa;
         }
+        
+        .profit-positive {
+            color: #10b981;
+            font-weight: bold;
+        }
+        
+        .profit-negative {
+            color: #ef4444;
+            font-weight: bold;
+        }
+        
+        .profit-neutral {
+            color: #6b7280;
+        }
 
         .order-buy {
             color: #10b981;
@@ -269,8 +283,8 @@
                         <span id="rpc-url" style="font-size: 0.85em; color: #666; margin-left: 5px;"></span>
                     </div>
                     <div style="display: inline-block;">
-                        <span id="raydium-status" class="status-badge" style="background: #9ca3af;">Đang kiểm tra...</span>
-                        <span style="font-size: 0.9em; margin-left: 5px;">Raydium Service</span>
+                        <span id="jupiter-status" class="status-badge" style="background: #9ca3af;">Đang kiểm tra...</span>
+                        <span style="font-size: 0.9em; margin-left: 5px;">Jupiter Service</span>
                     </div>
                 </div>
             </div>
@@ -293,7 +307,7 @@
         </div>
 
         <div class="card">
-            <h2>📈 Biểu đồ SOL/USDC với Bollinger Bands</h2>
+            <h2>📈 Biểu đồ SOL/USDC với Bollinger Bands (Timeframe: 5 phút)</h2>
             <div class="chart-container">
                 <canvas id="price-chart"></canvas>
             </div>
@@ -351,13 +365,14 @@
                         <th>Band dưới</th>
                         <th>Phí (SOL)</th>
                         <th>Phí (USDC)</th>
+                        <th>Lợi nhuận (USDC)</th>
                         <th>Transaction</th>
                         <th>Trạng thái</th>
                     </tr>
                 </thead>
                 <tbody id="trades-body">
                     <tr>
-                        <td colspan="11" class="loading">Đang tải dữ liệu...</td>
+                        <td colspan="12" class="loading">Đang tải dữ liệu...</td>
                     </tr>
                 </tbody>
             </table>
@@ -371,7 +386,6 @@
     <script>
         const API_BASE = '/api';
         const JUPITER_SERVICE_URL = 'http://localhost:3002';
-        const RAYDIUM_SERVICE_URL = 'http://localhost:3001';
         
         // Khởi tạo biểu đồ
         let priceChart = null;
@@ -382,6 +396,9 @@
         let currentPage = 1;
         let itemsPerPage = 25;
         let allTrades = [];
+        let currentBalances = [];
+        let initialBalances = null;
+        let currentPrice = null;
         
         // Lưu lịch sử balance trong localStorage
         const BALANCE_HISTORY_KEY = 'portfolio_balance_history';
@@ -547,6 +564,13 @@
                         tooltip: {
                             mode: 'index',
                             intersect: false,
+                            callbacks: {
+                                title: function(context) {
+                                    // Hiển thị timestamp với timeframe 5 phút
+                                    const label = context[0].label;
+                                    return `Timeframe: 5 phút - ${label}`;
+                                }
+                            }
                         },
                         annotation: {
                             annotations: [],
@@ -567,11 +591,12 @@
                         x: {
                             title: {
                                 display: true,
-                                text: 'Thời gian (60 phút gần nhất, mỗi nhãn = 1 phút)'
+                                text: 'Thời gian (5 giờ gần nhất, mỗi nhãn = 5 phút)'
                             },
                             ticks: {
-                                autoSkip: false,
-                                maxTicksLimit: 60
+                                autoSkip: true,
+                                maxTicksLimit: 12, // Hiển thị tối đa 12 nhãn cho 5 giờ dữ liệu (mỗi ~25 phút)
+                                stepSize: 1
                             }
                         }
                     },
@@ -887,10 +912,12 @@
             
             console.log('Updating chart with', priceHistory.length, 'price points');
             
-            // Tạo nhãn trục X theo timestamp (HH:MM), tối đa 60 điểm
+            // Tạo nhãn trục X theo timestamp (HH:MM), tối đa 60 điểm (5 giờ với timeframe 5 phút)
             const labels = priceHistory.map(p => {
                 const t = new Date(p.timestamp);
-                return `${t.getHours().toString().padStart(2,'0')}:${t.getMinutes().toString().padStart(2,'0')}`;
+                // Hiển thị cả giờ và phút, làm tròn phút về bội số của 5 để phù hợp với timeframe 5 phút
+                const minutes = Math.floor(t.getMinutes() / 5) * 5;
+                return `${t.getHours().toString().padStart(2,'0')}:${minutes.toString().padStart(2,'0')}`;
             });
             
             // Dữ liệu giá
@@ -949,7 +976,9 @@
             if (trades && trades.length > 0) {
                 trades.forEach(tr => {
                     const t = new Date(tr.timestamp);
-                    const lb = `${t.getHours().toString().padStart(2,'0')}:${t.getMinutes().toString().padStart(2,'0')}`;
+                    // Làm tròn phút về bội số của 5 cho timeframe 5 phút
+                    const minutes = Math.floor(t.getMinutes() / 5) * 5;
+                    const lb = `${t.getHours().toString().padStart(2,'0')}:${minutes.toString().padStart(2,'0')}`;
                     const idx = labelIndexMap.get(lb);
                     if (idx !== undefined && idx >= 0 && idx < labels.length) {
                         // Lấy giá trị Bollinger Bands và close price tại thời điểm này
@@ -1234,21 +1263,24 @@
                         rpcUrl.textContent = '';
                     }
                     
-                    // Raydium Service status
-                    const raydiumStatus = document.getElementById('raydium-status');
-                    if (apiStatus.raydium_service === 'connected') {
-                        raydiumStatus.textContent = '✅ Sẵn sàng';
-                        raydiumStatus.style.background = '#10b981';
-                    } else if (apiStatus.raydium_service === 'disconnected') {
-                        raydiumStatus.textContent = '❌ Mất kết nối';
-                        raydiumStatus.style.background = '#ef4444';
+                    // Jupiter Service status
+                    const jupiterStatus = document.getElementById('jupiter-status');
+                    if (apiStatus.jupiter_service === 'connected') {
+                        jupiterStatus.textContent = '✅ Sẵn sàng';
+                        jupiterStatus.style.background = '#10b981';
+                    } else if (apiStatus.jupiter_service === 'disconnected') {
+                        jupiterStatus.textContent = '❌ Mất kết nối';
+                        jupiterStatus.style.background = '#ef4444';
                     } else {
-                        raydiumStatus.textContent = '⏳ Đang kiểm tra...';
-                        raydiumStatus.style.background = '#9ca3af';
+                        jupiterStatus.textContent = '⏳ Đang kiểm tra...';
+                        jupiterStatus.style.background = '#9ca3af';
                     }
                 }
 
                 // Update balances
+                currentBalances = data.balances || [];
+                initialBalances = data.initial_balances || null;
+                currentPrice = data.current_price || null;
                 updateBalances(data.balances, data.initial_balances);
 
                 // Update Bollinger Bands
@@ -1323,7 +1355,7 @@
         function updateBollingerBands(bands) {
             const container = document.getElementById('bollinger-info');
             if (!bands) {
-                container.innerHTML = '<div class="loading">Chưa có dữ liệu (cần 20 nến 1 phút)</div>';
+                container.innerHTML = '<div class="loading">Chưa có dữ liệu (cần 20 nến 5 phút)</div>';
                 return;
             }
 
@@ -1361,13 +1393,104 @@
             renderTrades();
         }
         
+        // Tính tổng lợi nhuận từ các giao dịch SOL/USDC đã thực hiện
+        function calculateTotalProfit() {
+            if (!allTrades || allTrades.length === 0) {
+                return 0;
+            }
+            
+            // Sắp xếp trades theo thời gian tăng dần
+            const sortedTrades = allTrades.slice().sort((a, b) => 
+                new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+            );
+            
+            // Track số lượng SOL đã mua chưa bán (FIFO queue)
+            const solInventory = [];
+            let totalProfit = 0;
+            
+            sortedTrades.forEach(trade => {
+                if (trade.status !== 'SUCCESS') {
+                    return; // Bỏ qua giao dịch thất bại
+                }
+                
+                const amount = trade.amount || 0;
+                const price = trade.entry_price || 0;
+                const feeUsdc = trade.fee_usdc !== undefined && trade.fee_usdc !== null 
+                    ? trade.fee_usdc 
+                    : ((trade.fee || 0) * price);
+                
+                if (trade.order_type === 'BUY') {
+                    // Thêm vào inventory
+                    solInventory.push({
+                        amount: amount,
+                        price: price,
+                        fee: feeUsdc
+                    });
+                } else if (trade.order_type === 'SELL') {
+                    // Bán từ inventory theo FIFO
+                    let remainingToSell = amount;
+                    let sellCost = 0; // Tổng chi phí mua (giá mua + phí)
+                    
+                    while (remainingToSell > 0 && solInventory.length > 0) {
+                        const buyLot = solInventory[0];
+                        const sellAmount = Math.min(remainingToSell, buyLot.amount);
+                        
+                        // Tính chi phí cho phần này
+                        const costPerSol = buyLot.price + (buyLot.fee / buyLot.amount);
+                        sellCost += sellAmount * costPerSol;
+                        
+                        // Cập nhật inventory
+                        buyLot.amount -= sellAmount;
+                        if (buyLot.amount <= 0.0001) { // Xử lý số thập phân nhỏ
+                            solInventory.shift(); // Xóa lot đã bán hết
+                        }
+                        
+                        remainingToSell -= sellAmount;
+                    }
+                    
+                    if (sellCost > 0) {
+                        // Tính profit: (giá bán × số lượng) - (chi phí mua) - (phí bán)
+                        const sellRevenue = amount * price;
+                        const profit = sellRevenue - sellCost - feeUsdc;
+                        totalProfit += profit;
+                    }
+                }
+            });
+            
+            return totalProfit;
+        }
+        
+        // Cập nhật header cột Lợi nhuận với tổng profit
+        function updateProfitHeader() {
+            const profitHeader = Array.from(document.querySelectorAll('th')).find(th => 
+                th.textContent.includes('Lợi nhuận (USDC)')
+            );
+            
+            if (profitHeader) {
+                const totalProfit = calculateTotalProfit();
+                let profitDisplay = '';
+                
+                if (totalProfit > 0) {
+                    profitDisplay = `<span style="color: #10b981; font-weight: bold;">+$${totalProfit.toFixed(4)}</span>`;
+                } else if (totalProfit < 0) {
+                    profitDisplay = `<span style="color: #ef4444; font-weight: bold;">$${totalProfit.toFixed(4)}</span>`;
+                } else {
+                    profitDisplay = `<span style="color: #6b7280;">$0.0000</span>`;
+                }
+                
+                profitHeader.innerHTML = `Lợi nhuận (USDC)<br><small style="font-size: 0.75em; font-weight: normal;">Tổng: ${profitDisplay}</small>`;
+            }
+        }
+        
         function renderTrades() {
             const tbody = document.getElementById('trades-body');
             const paginationControls = document.getElementById('pagination-controls');
             
             if (allTrades.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="11" class="loading">Chưa có giao dịch nào</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="12" class="loading">Chưa có giao dịch nào</td></tr>';
                 paginationControls.innerHTML = '';
+                // Cập nhật header ngay cả khi không có giao dịch
+                updateProfitHeader();
                 return;
             }
             
@@ -1396,6 +1519,88 @@
                     : (fee * entryPrice); // Tính lại nếu thiếu
                 const txSig = trade.transaction_signature || 'N/A';
                 
+                // Tính profit cho giao dịch SELL sử dụng FIFO
+                let profit = null;
+                let profitText = '-';
+                let profitClass = '';
+                
+                if (trade.order_type === 'SELL' && trade.status === 'SUCCESS') {
+                    // Sắp xếp tất cả trades theo thời gian tăng dần
+                    const sortedTrades = allTrades.slice().sort((a, b) => 
+                        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+                    );
+                    
+                    // Tìm vị trí của trade hiện tại
+                    const currentTradeIndex = sortedTrades.findIndex(t => 
+                        t.timestamp === trade.timestamp && 
+                        t.order_type === trade.order_type &&
+                        t.amount === trade.amount
+                    );
+                    
+                    if (currentTradeIndex >= 0) {
+                        // Lấy các trades trước trade hiện tại
+                        const previousTrades = sortedTrades.slice(0, currentTradeIndex);
+                        
+                        // Tạo inventory từ các BUY trước đó
+                        const solInventory = [];
+                        previousTrades.forEach(t => {
+                            if (t.status === 'SUCCESS' && t.order_type === 'BUY') {
+                                const tAmount = t.amount || 0;
+                                const tPrice = t.entry_price || 0;
+                                const tFeeUsdc = t.fee_usdc !== undefined && t.fee_usdc !== null 
+                                    ? t.fee_usdc 
+                                    : ((t.fee || 0) * tPrice);
+                                
+                                solInventory.push({
+                                    amount: tAmount,
+                                    price: tPrice,
+                                    fee: tFeeUsdc
+                                });
+                            }
+                        });
+                        
+                        // Tính profit từ inventory theo FIFO
+                        let remainingToSell = amount;
+                        let sellCost = 0; // Tổng chi phí mua (giá mua + phí)
+                        
+                        while (remainingToSell > 0 && solInventory.length > 0) {
+                            const buyLot = solInventory[0];
+                            const sellAmount = Math.min(remainingToSell, buyLot.amount);
+                            
+                            // Tính chi phí cho phần này: (giá mua × số lượng) + (phí mua × tỷ lệ)
+                            const costForThisAmount = (buyLot.price * sellAmount) + (buyLot.fee * (sellAmount / buyLot.amount));
+                            sellCost += costForThisAmount;
+                            
+                            // Cập nhật inventory
+                            buyLot.amount -= sellAmount;
+                            buyLot.fee -= (buyLot.fee * (sellAmount / (buyLot.amount + sellAmount)));
+                            if (buyLot.amount <= 0.0001) {
+                                solInventory.shift();
+                            }
+                            
+                            remainingToSell -= sellAmount;
+                        }
+                        
+                        if (sellCost > 0) {
+                            // Tính profit: (giá bán × số lượng) - (chi phí mua) - (phí bán)
+                            const sellRevenue = amount * entryPrice;
+                            const profitValue = sellRevenue - sellCost - feeUsdc;
+                            profit = profitValue;
+                            
+                            if (profitValue > 0) {
+                                profitText = `+$${profitValue.toFixed(4)}`;
+                                profitClass = 'profit-positive';
+                            } else if (profitValue < 0) {
+                                profitText = `$${profitValue.toFixed(4)}`;
+                                profitClass = 'profit-negative';
+                            } else {
+                                profitText = '$0.0000';
+                                profitClass = 'profit-neutral';
+                            }
+                        }
+                    }
+                }
+                
                 return `
                 <tr>
                     <td>${stt}</td>
@@ -1409,6 +1614,9 @@
                     <td>$${lowerBand.toFixed(4)}</td>
                     <td>${fee.toFixed(6)} SOL</td>
                     <td>$${feeUsdc.toFixed(6)}</td>
+                    <td class="${profitClass}" style="font-weight: ${profit !== null ? 'bold' : 'normal'};">
+                        ${profitText}
+                    </td>
                     <td>
                         <a href="https://solscan.io/tx/${txSig}" target="_blank" style="color: #667eea;">
                             ${txSig !== 'N/A' ? txSig.substring(0, 8) + '...' : 'N/A'}
@@ -1478,6 +1686,9 @@
             paginationHTML += `<span style="margin-left: 15px; color: #666; font-size: 0.9em;">Trang ${currentPage} / ${totalPages} (${reversedTrades.length} giao dịch)</span>`;
             
             paginationControls.innerHTML = paginationHTML;
+            
+            // Cập nhật header với tổng profit
+            updateProfitHeader();
         }
         
         function updateTrades(trades) {

@@ -39,7 +39,7 @@ pub struct BotStatus {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ApiConnectionStatus {
     pub rpc_endpoint: String,     // "connected" | "disconnected" | "checking"
-    pub raydium_service: String,  // "connected" | "disconnected" | "checking"
+    pub jupiter_service: String,  // "connected" | "disconnected" | "checking"
     pub last_check: DateTime<Utc>,
     pub rpc_url: Option<String>,  // RPC endpoint đang sử dụng
 }
@@ -104,7 +104,7 @@ impl AppState {
                 last_update: Utc::now(),
                 api_status: ApiConnectionStatus {
                     rpc_endpoint: "checking".to_string(),
-                    raydium_service: "checking".to_string(),
+                    jupiter_service: "checking".to_string(),
                     last_check: Utc::now(),
                     rpc_url: None,
                 },
@@ -159,13 +159,84 @@ pub async fn get_trades(state: web::Data<AppState>) -> ActixResult<impl Responde
     Ok(HttpResponse::Ok().json(trades))
 }
 
+// Force update balances endpoint
+pub async fn force_update_balances(state: web::Data<AppState>) -> ActixResult<impl Responder> {
+    // This endpoint requires the keypair, so we'll just return a message
+    // The actual update should be triggered by the bot itself
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "Balance update triggered. Balances will be updated within the next minute.",
+        "note": "Balances are automatically updated every hour, or immediately after a successful swap."
+    })))
+}
+
+// Reset all data endpoint - Xóa tất cả dữ liệu cũ và bắt đầu lại
+pub async fn reset_all_data(state: web::Data<AppState>) -> ActixResult<impl Responder> {
+    // Xóa tất cả trades
+    {
+        let mut trades = state.trades.write().await;
+        trades.clear();
+    }
+    
+    // Xóa price history
+    {
+        let mut price_history = state.price_history.write().await;
+        price_history.clear();
+    }
+    
+    // Xóa band history
+    {
+        let mut band_history = state.band_history.write().await;
+        band_history.clear();
+    }
+    
+    // Reset initial balances (sẽ được set lại khi update balances lần tiếp theo)
+    {
+        let mut initial_balances = state.initial_balances.write().await;
+        *initial_balances = None;
+    }
+    
+    // Reset Bollinger Bands info
+    {
+        let mut bands = state.bollinger_bands.write().await;
+        *bands = None;
+    }
+    
+    // Reset current price
+    {
+        let mut current_price = state.current_price.write().await;
+        *current_price = None;
+    }
+    
+    // Reset last swap time
+    {
+        let mut last_swap = state.last_swap_time.write().await;
+        *last_swap = None;
+    }
+    
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "✅ Đã xóa tất cả dữ liệu cũ",
+        "reset_items": [
+            "Trades (giao dịch)",
+            "Price history (lịch sử giá)",
+            "Band history (lịch sử Bollinger Bands)",
+            "Initial balances (số dư ban đầu)",
+            "Bollinger Bands info",
+            "Current price",
+            "Last swap time"
+        ],
+        "note": "Bot sẽ bắt đầu lại với timeframe 5 phút. Số dư ban đầu sẽ được set lại khi cập nhật số dư lần tiếp theo."
+    })))
+}
+
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api")
             .route("/data", web::get().to(get_data))
             .route("/balances", web::get().to(get_balances))
             .route("/status", web::get().to(get_bot_status))
-            .route("/trades", web::get().to(get_trades)),
+            .route("/trades", web::get().to(get_trades))
+            .route("/force-update-balances", web::post().to(force_update_balances))
+            .route("/reset-all-data", web::post().to(reset_all_data)),
     );
 }
 

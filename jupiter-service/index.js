@@ -10,7 +10,9 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-dotenv.config();
+// Load .env from parent directory if not found in current directory
+dotenv.config({ path: path.join(__dirname, '../.env') });
+dotenv.config(); // Also try current directory
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -48,27 +50,53 @@ async function initialize() {
             confirmTransactionInitialTimeout: 60000,
         });
         
-        // Load wallet
-        const walletPath = process.env.WALLET_PRIVATE_KEY || '~/.config/solana/id.json';
-        const expandedPath = walletPath.startsWith('~') 
-            ? walletPath.replace('~', process.env.HOME || process.env.USERPROFILE || '')
-            : walletPath;
+        // Load wallet - ALWAYS prioritize WALLET_PRIVATE_KEY from .env
+        const walletKey = process.env.WALLET_PRIVATE_KEY;
+        
+        if (!walletKey) {
+            throw new Error('WALLET_PRIVATE_KEY not found in .env');
+        }
         
         let keypair;
-        if (fs.existsSync(expandedPath)) {
-            const keyData = JSON.parse(fs.readFileSync(expandedPath, 'utf8'));
-            keypair = Keypair.fromSecretKey(new Uint8Array(keyData));
-        } else if (walletPath.startsWith('[') || !walletPath.includes('/')) {
-            // Try parsing as base58 or JSON array
+        
+        // Priority 1: If it's a base58 string (most common case)
+        if (!walletKey.includes('/') && !walletKey.startsWith('~') && !walletKey.startsWith('.') && !walletKey.startsWith('[')) {
+            // Try parsing as base58 string
             try {
-                const decoded = bs58.decode(walletPath);
-                keypair = Keypair.fromSecretKey(decoded);
-            } catch {
-                const keyData = JSON.parse(walletPath);
-                keypair = Keypair.fromSecretKey(new Uint8Array(keyData));
+                const decoded = bs58.decode(walletKey);
+                if (decoded.length === 64) {
+                    keypair = Keypair.fromSecretKey(decoded);
+                    console.log(`   ✅ Loading wallet from base58 private key in .env`);
+                } else {
+                    throw new Error('Invalid base58 key length');
+                }
+            } catch (e) {
+                throw new Error(`Failed to decode base58 private key: ${e.message}`);
             }
-        } else {
-            throw new Error(`Wallet file not found: ${expandedPath}`);
+        }
+        // Priority 2: If it's a JSON array
+        else if (walletKey.startsWith('[')) {
+            try {
+                const keyData = JSON.parse(walletKey);
+                keypair = Keypair.fromSecretKey(new Uint8Array(keyData));
+                console.log(`   ✅ Loading wallet from JSON array in .env`);
+            } catch (e) {
+                throw new Error(`Failed to parse JSON array: ${e.message}`);
+            }
+        }
+        // Priority 3: If it's a file path
+        else {
+            const expandedPath = walletKey.startsWith('~') 
+                ? walletKey.replace('~', process.env.HOME || process.env.USERPROFILE || '')
+                : walletKey;
+            
+            if (fs.existsSync(expandedPath)) {
+                const keyData = JSON.parse(fs.readFileSync(expandedPath, 'utf8'));
+                keypair = Keypair.fromSecretKey(new Uint8Array(keyData));
+                console.log(`   ✅ Loading wallet from file: ${expandedPath}`);
+            } else {
+                throw new Error(`Wallet file not found: ${expandedPath}`);
+            }
         }
         
         owner = keypair;
